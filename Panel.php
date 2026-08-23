@@ -23,8 +23,8 @@ $keys = $redis ? $redis->keys($prefix . '*') : [];
 $cacheItems = [];
 if ($keys) {
     foreach ($keys as $key) {
-        // Exclude test keys or logs if any
-        if (str_ends_with($key, ':test')) continue;
+        // 跳过控制键：连接测试、键结构版本标记与迁移锁，均不是内容缓存
+        if (in_array($key, [$prefix . 'test', $prefix . 'schema', $prefix . 'schema:lock'], true)) continue;
 
         try {
             $size = $redis->rawCommand('MEMORY', 'USAGE', $key);

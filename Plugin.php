@@ -33,6 +33,18 @@ if (!defined('__TYPECHO_ROOT_DIR__')) {
 class Plugin implements PluginInterface
 {
     /**
+     * 缓存键结构版本
+     *
+     * 当 makeCacheKey() 生成的键名结构发生变化时必须递增此版本号。
+     * 插件会在下一次连接 Redis 时自动清理所有不符合当前结构的历史缓存，
+     * 避免旧键既无法命中、又无法被按 cid 精确清理而长期滞留。
+     *
+     * v1: {prefix}post:{md5} / {prefix}page:{md5}
+     * v2: {prefix}{post|page|list}:{id}:{md5}
+     */
+    private const SCHEMA_VERSION = '2';
+
+    /**
      * 初始化实例
      */
     private static ?Redis $redis = null;
@@ -379,6 +391,16 @@ class Plugin implements PluginInterface
 
             self::writeLog($logFilename, $logMessage);
 
+            // 键结构迁移：清理不符合当前结构版本的历史缓存（失败不影响主流程）
+            try {
+                self::migrateSchema($redis, $logFilename);
+            } catch (Throwable $e) {
+                self::writeLog(
+                    $logFilename,
+                    date('[Y-m-d H:i:s]') . ' schema migration failed: ' . $e->getMessage()
+                );
+            }
+
             self::$redis = $redis;
             return $redis;
         } catch (Throwable $e) {
@@ -572,6 +594,95 @@ class Plugin implements PluginInterface
         }
 
         return $deleted;
+    }
+
+    /**
+     * 键结构迁移
+     *
+     * 用一个哨兵键记录当前使用的键结构版本，版本不匹配时清理全部历史格式缓存。
+     *
+     * 之所以放在这里而不是 activate()：Typecho 在禁用插件时会一并删除插件配置
+     * （var/Widget/Plugins/Edit.php），activate() 执行时拿不到 Redis 连接参数；
+     * 而覆盖文件升级时插件保持启用状态，activate() 根本不会被调用。
+     * 挂在连接建立之后，才能覆盖到全部升级路径。
+     *
+     * @param Redis  $redis
+     * @param string $logFilename
+     * @return void
+     */
+    private static function migrateSchema(Redis $redis, string $logFilename): void
+    {
+        $schemaKey = self::$prefix . 'schema';
+
+        if ($redis->get($schemaKey) === self::SCHEMA_VERSION) {
+            return;
+        }
+
+        // 抢占迁移锁，避免并发请求同时扫描整个 keyspace；
+        // 抢不到说明已有请求在迁移，本次直接跳过即可
+        $lockKey = self::$prefix . 'schema:lock';
+        if (!$redis->set($lockKey, '1', ['nx', 'ex' => 60])) {
+            return;
+        }
+
+        $purged = self::purgeLegacyKeys($redis);
+
+        $redis->set($schemaKey, self::SCHEMA_VERSION);
+        $redis->del($lockKey);
+
+        self::writeLog(
+            $logFilename,
+            date('[Y-m-d H:i:s]') . ' schema migrated to v' . self::SCHEMA_VERSION
+                . ': purged ' . $purged . ' legacy key(s)'
+        );
+    }
+
+    /**
+     * 清理所有不符合当前键结构的缓存
+     *
+     * 采用「白名单」策略：只保留符合当前结构的内容键与少量控制键，
+     * 其余一律删除。这样将来再次调整键结构时，只需递增 SCHEMA_VERSION，
+     * 无需为每一种历史格式单独编写匹配规则。
+     *
+     * @param Redis $redis
+     * @return int 实际删除的键数量
+     */
+    private static function purgeLegacyKeys(Redis $redis): int
+    {
+        // 当前内容键结构：{type}:{id}:{md5}
+        $currentShape = '/^(post|page|list):\d+:[0-9a-f]{32}$/';
+
+        // 控制键：连接测试、结构版本标记、迁移锁，不属于内容缓存，需保留
+        $reserved = ['test', 'schema', 'schema:lock'];
+
+        $purged   = 0;
+        $stale    = [];
+        $iterator = null;
+
+        $redis->setOption(Redis::OPT_SCAN, Redis::SCAN_RETRY);
+
+        while (($keys = $redis->scan($iterator, self::$prefix . '*', 500)) !== false) {
+            foreach ($keys as $key) {
+                $name = substr($key, strlen(self::$prefix));
+
+                if (in_array($name, $reserved, true) || preg_match($currentShape, $name)) {
+                    continue;
+                }
+
+                $stale[] = $key;
+
+                if (count($stale) >= 500) {
+                    $purged += intval($redis->del($stale));
+                    $stale = [];
+                }
+            }
+        }
+
+        if (!empty($stale)) {
+            $purged += intval($redis->del($stale));
+        }
+
+        return $purged;
     }
 
     /**
