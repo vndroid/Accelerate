@@ -98,7 +98,7 @@ class Plugin implements PluginInterface
         \Typecho\Plugin::factory('admin/footer.php')->begin = [self::class, 'injectFooterJs'];
         \Typecho\Plugin::factory('admin/menu.php')->navBar = [self::class, 'addAdminPageBar'];
 
-        Helper::addPanel(3, 'RedisCache/Panel.php', _t('Redis 缓存'), _t('Redis 缓存管理'), 'administrator');
+        Helper::addPanel(3, 'RedisCache/Panel.php', _t('缓存管理'), _t('文章缓存清单'), 'administrator');
 
         $configLink = '<a href="' . Helper::options()->adminUrl('options-plugin.php?config=RedisCache', true) . '">' . _t('前往设置') . '</a>';
         return _t('插件已启用，但缓存功能未启用，请检查缓存 URI ，') . $configLink;
