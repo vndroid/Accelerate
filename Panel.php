@@ -70,7 +70,7 @@ if ($keys) {
 <main class="main">
     <div class="body container">
         <div class="typecho-page-title">
-            <h2><?php _e('RedisCache 管理'); ?></h2>
+            <h2><?php _e('页面缓存管理'); ?></h2>
         </div>
         <div class="row typecho-page-main" role="main">
             <div class="col-mb-12 typecho-list">
@@ -102,9 +102,9 @@ if ($keys) {
                                 <thead>
                                     <tr>
                                         <th> </th>
-                                        <th><?php _e('类型'); ?></th>
+                                        <th><?php _e('缓存类型'); ?></th>
                                         <th><?php _e('缓存键名'); ?></th>
-                                        <th><?php _e('大小'); ?></th>
+                                        <th><?php _e('缓存大小'); ?></th>
                                         <th><?php _e('过期时间'); ?></th>
                                     </tr>
                                 </thead>
