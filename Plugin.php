@@ -700,18 +700,46 @@ class Plugin implements PluginInterface
     }
 
     /**
-     * 判断当前请求方法是否可以走缓存
+     * 判断当前请求本身是否可以参与缓存
      *
-     * 只有 HTTP 安全方法（GET / HEAD）才允许读写缓存。
-     * POST / PUT / DELETE 等写请求必须走完整渲染流程，
-     * 否则会被 beforeRender 直接吐缓存并 exit()，导致表单提交被静默吞掉。
+     * 这里只依据 HTTP 请求与 Typecho 核心的行为做判断，不涉及任何具体主题，
+     * 目的是让插件在任意主题下都不会缓存出「与单次请求绑定」的内容。
      *
      * @return bool
      */
-    private static function isCacheableRequestMethod(): bool
+    private static function isCacheableRequest(): bool
     {
+        // 1) 只缓存 HTTP 安全方法。POST 等写请求若被 beforeRender 直接吐缓存并
+        //    exit()，表单提交会被静默吞掉。
         $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
-        return $method === 'GET' || $method === 'HEAD';
+        if ($method !== 'GET' && $method !== 'HEAD') {
+            return false;
+        }
+
+        // 2) 带查询串的请求一律不缓存。
+        //    其一，Typecho 开启「反垃圾保护」时会在页面里输出
+        //    md5(secret & 完整请求 URL) 派生的一次性 token，提交时用 Referer 比对；
+        //    若缓存键忽略查询串，带 utm/ref 等参数的首访会把与自身 URL 绑定的 token
+        //    写进缓存，后续访客提交时会被静默拒绝。
+        //    其二，?replyTo= 之类参数会改变页面内容，忽略它会让嵌套回复失效。
+        //    其三，跳过带参请求可避免随机查询串撑爆缓存（缓存投毒式 DoS）。
+        $query = $_SERVER['QUERY_STRING'] ?? (parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_QUERY) ?? '');
+        if ($query !== '') {
+            return false;
+        }
+
+        // 3) 携带 Typecho 评论态 cookie 的请求不缓存。
+        //    评论校验失败或待审核时，Typecho 会写入 __typecho_remember_*、
+        //    __typecho_unapproved_comment 等 cookie，主题可能据此回填表单或
+        //    显示「您的评论正在审核」。这类页面含有该访客的私有内容，
+        //    一旦写入缓存就会广播给所有人。
+        foreach (array_keys($_COOKIE) as $name) {
+            if (str_starts_with($name, '__typecho_remember_') || $name === '__typecho_unapproved_comment') {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -724,13 +752,24 @@ class Plugin implements PluginInterface
      */
     public static function beforeRender(Archive $archive): void
     {
-        // 非安全方法（POST 等）不读缓存，交还给原始渲染流程
-        if (!self::isCacheableRequestMethod()) {
+        if (!self::isCacheableRequest()) {
             return;
         }
 
         $user = User::alloc();
         if ($user->hasLogin()) {
+            return;
+        }
+
+        // 扩展点：允许主题或其他插件否决本次缓存，用于处理插件无法感知的
+        // 主题级动态内容。注册方式（例如在主题的 themeInit 中）：
+        //
+        //   \Typecho\Plugin::factory('TypechoPlugin\RedisCache\Plugin')->skipCache
+        //       = 'yourCallback';
+        //
+        // 回调签名：function (bool $skip, Archive $archive, string $requestUri): bool
+        $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+        if (\Typecho\Plugin::factory(self::class)->filter('skipCache', false, $archive, $requestPath)) {
             return;
         }
 
@@ -863,6 +902,17 @@ class Plugin implements PluginInterface
         $cacheKey = self::makeCacheKey($requestUri, $archive);
         $ttl      = self::getExpireForArchive($archive);
 
+        // 若站点开启了「评论自动关闭」，缓存不应活过该内容仍可评论的时间窗，
+        // 否则评论关闭之后缓存页仍会显示评论表单，访客提交会被 403 拒绝。
+        // 关闭时刻是确定的：created + commentsPostTimeout（见 Base/Contents::allow）
+        $options = Helper::options();
+        if ($archive->is('single') && $options->commentsAutoClose && $options->commentsPostTimeout > 0) {
+            $closesIn = intval($archive->created) + intval($options->commentsPostTimeout) - time();
+            if ($closesIn > 0 && $closesIn < $ttl) {
+                $ttl = $closesIn;
+            }
+        }
+
         $redis->setex($cacheKey, $ttl, $content);
         echo $content;
 
@@ -910,6 +960,27 @@ class Plugin implements PluginInterface
         $clearLists = !isset($config->clearListOnComment) || $config->clearListOnComment == '1';
 
         self::purgeCache($cid, $clearLists, 'NEW COMMENT' . ($cid > 0 ? ' ON CID ' . $cid : ' (CID UNKNOWN)'));
+    }
+
+    /**
+     * 清空全部内容缓存（公开 API）
+     *
+     * 供主题或其他插件在自身配置变更后主动调用，例如主题轮换了第三方服务的
+     * 站点密钥、切换了会影响所有页面的开关时：
+     *
+     *   if (class_exists('\TypechoPlugin\RedisCache\Plugin')) {
+     *       \TypechoPlugin\RedisCache\Plugin::flushAll('RECAPTCHA KEY ROTATED');
+     *   }
+     *
+     * 用 class_exists 保护即可，调用方不会因为未安装本插件而报错。
+     *
+     * @param string $reason 写入日志的原因说明
+     * @return void
+     * @throws PluginException
+     */
+    public static function flushAll(string $reason = 'MANUAL FLUSH'): void
+    {
+        self::purgeCache(0, true, $reason);
     }
 
     /**
