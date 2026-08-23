@@ -36,16 +36,29 @@ if ($keys) {
         }
         $ttl = $redis->ttl($key);
 
-        // Remove prefix to parse out type and MD5 hash
+        // Remove prefix to parse out type, cid and MD5 hash
+        // 统一三段式 {type}:{id}:{md5}，列表页的 id 段固定为 0
         $keyWithoutPrefix = substr($key, strlen($prefix));
-        $parts = explode(':', $keyWithoutPrefix, 2);
+        $parts = explode(':', $keyWithoutPrefix);
 
-        $type = isset($parts[0]) && in_array($parts[0], ['post', 'page']) ? $parts[0] : 'unknown';
-        $md5Key = isset($parts[1]) ? $parts[1] : $keyWithoutPrefix;
+        $type = 'unknown';
+        $cid = '';
+        $md5Key = $keyWithoutPrefix;
+
+        if (count($parts) === 3 && in_array($parts[0], ['post', 'page', 'list'], true)) {
+            $type = $parts[0];
+            $cid = $parts[1] === '0' ? '' : $parts[1];
+            $md5Key = $parts[2];
+        } elseif (count($parts) === 2 && in_array($parts[0], ['post', 'page'], true)) {
+            // 兼容 0.1.0 及更早版本生成的、不带 cid 的缓存键
+            $type = $parts[0];
+            $md5Key = $parts[1];
+        }
 
         $cacheItems[] = [
             'key' => $key,
             'type' => $type,
+            'cid' => $cid,
             'md5Key' => $md5Key,
             'size' => $size,
             'ttl' => $ttl
@@ -104,7 +117,7 @@ if ($keys) {
                                                     <span class="status"><?php echo htmlspecialchars(strtoupper($item['type'])); ?></span>
                                                 </td>
                                                 <td>
-                                                    <?php echo htmlspecialchars($item['md5Key']); ?>
+                                                    <?php if ($item['cid'] !== ''): ?><strong>#<?php echo htmlspecialchars($item['cid']); ?></strong> &middot; <?php endif; ?><?php echo htmlspecialchars($item['md5Key']); ?>
                                                 </td>
                                                 <td><?php echo number_format($item['size'] / 1024, 2); ?> KB</td>
                                                 <td><?php echo $item['ttl'] > 0 ? $item['ttl'] . ' 秒' : '永久'; ?></td>

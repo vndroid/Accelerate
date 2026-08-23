@@ -109,11 +109,7 @@ class Plugin implements PluginInterface
         if ($shouldCleanCache) {
             $redis = self::initRedis();
             if ($redis) {
-                $keys = $redis->keys(self::$prefix . '*');
-                if (!empty($keys)) {
-                    $cleanCount = count($keys);
-                    $redis->del($keys);
-                }
+                $cleanCount = self::deleteByPattern($redis, self::$prefix . '*');
             }
         }
 
@@ -226,6 +222,15 @@ class Plugin implements PluginInterface
             _t('按路径后缀进行缓存，如配置 .html 则只缓存以 .html 结尾的页面；根路径 / 始终被缓存，不受此规则限制；多个后缀请用英文逗号分隔；留空表示不限制；与匹配前缀同时配置时，需同时满足才会缓存')
         );
         $form->addInput($uriSuffix);
+
+        $clearListOnComment = new Radio(
+            'clearListOnComment',
+            ['1' => _t('清理'), '0' => _t('保留')],
+            '1',
+            _t('评论时清理列表页缓存'),
+            _t('产生新评论时，除该内容自身的缓存外，是否一并清理首页/分类/标签/归档等列表页缓存。若主题会在列表页显示评论数，请选择「清理」；若不显示，选择「保留」可以大幅缩小缓存失效范围')
+        );
+        $form->addInput($clearListOnComment);
 
         $debug = new Radio(
             'debug',
@@ -514,8 +519,15 @@ class Plugin implements PluginInterface
     /**
      * 根据内容类型生成缓存键
      *
-     * - page → prefix + page:md5(uri)
-     * - post → prefix + post:md5(uri)
+     * 统一为 {type}:{id}:{hash} 三段式：
+     *
+     * - 文章     → prefix + post:{cid}:md5(uri)
+     * - 独立页面 → prefix + page:{cid}:md5(uri)
+     * - 列表页   → prefix + list:0:md5(uri)（首页 / 分类 / 标签 / 归档 / 搜索）
+     *
+     * 把 cid 编进键名，是为了在内容更新或收到评论时能够按 cid 精确清理，
+     * 而不必像旧版那样清空全站缓存；列表页不隶属于任何单篇内容，
+     * id 段固定为 0，以保证 hash 恒定位于第 3 段。
      *
      * @param string  $requestUri
      * @param Archive $archive
@@ -523,10 +535,43 @@ class Plugin implements PluginInterface
      */
     private static function makeCacheKey(string $requestUri, Archive $archive): string
     {
-        if ($archive->is('page')) {
-            return self::$prefix . 'page:' . md5($requestUri);
+        $hash = md5($requestUri);
+
+        if ($archive->is('single')) {
+            $cid = intval($archive->cid);
+            if ($cid > 0) {
+                return self::$prefix . ($archive->is('page') ? 'page' : 'post') . ':' . $cid . ':' . $hash;
+            }
         }
-        return self::$prefix . 'post:' . md5($requestUri);
+
+        return self::$prefix . 'list:0:' . $hash;
+    }
+
+    /**
+     * 按模式批量删除缓存键
+     *
+     * 使用 SCAN 游标迭代而非 KEYS，避免键数量较多时阻塞 Redis 主线程。
+     *
+     * @param Redis  $redis
+     * @param string $pattern 完整的键名匹配模式（需自行带上前缀）
+     * @return int 实际删除的键数量
+     */
+    private static function deleteByPattern(Redis $redis, string $pattern): int
+    {
+        $deleted  = 0;
+        $iterator = null;
+
+        // SCAN_RETRY：某一轮没有匹配结果时由 phpredis 自动继续迭代，
+        // 迭代结束时返回 false，因此可以安全地用 while 取值
+        $redis->setOption(Redis::OPT_SCAN, Redis::SCAN_RETRY);
+
+        while (($keys = $redis->scan($iterator, $pattern, 500)) !== false) {
+            if (!empty($keys)) {
+                $deleted += intval($redis->del($keys));
+            }
+        }
+
+        return $deleted;
     }
 
     /**
@@ -721,6 +766,9 @@ class Plugin implements PluginInterface
     /**
      * 文章/独立页面发布时清除缓存（finishPublish 钩子传入 $contents, $widget）
      *
+     * 内容发布或更新会同时改变该内容自身与所有列表页（标题、摘要、排序），
+     * 因此在清理该 cid 的缓存之外，还需要清理全部列表页缓存。
+     *
      * @param array $contents 内容数组
      * @param PostEdit|PageEdit $widget 编辑组件
      * @return void
@@ -728,11 +776,16 @@ class Plugin implements PluginInterface
      */
     public static function clearCacheOnPublish(array $contents, PostEdit|PageEdit $widget): void
     {
-        self::flushPageCache();
+        $cid = intval($contents['cid'] ?? 0) ?: intval($widget->cid);
+
+        self::purgeCache($cid, true, 'CONTENT UPDATED' . ($cid > 0 ? ' CID ' . $cid : ''));
     }
 
     /**
      * 评论提交时清除缓存（finishComment 钩子仅传入 $this）
+     *
+     * Feedback::$content 是私有属性，但评论行此时已经 push 进 widget，
+     * 因此 $widget->cid 即为被评论内容的 ID。
      *
      * @param Feedback $widget 评论组件
      * @return void
@@ -740,38 +793,52 @@ class Plugin implements PluginInterface
      */
     public static function clearCacheOnComment(Feedback $widget): void
     {
-        self::flushPageCache();
+        $cid = intval($widget->cid);
+
+        $config     = Helper::options()->plugin(basename(__DIR__));
+        $clearLists = !isset($config->clearListOnComment) || $config->clearListOnComment == '1';
+
+        self::purgeCache($cid, $clearLists, 'NEW COMMENT' . ($cid > 0 ? ' ON CID ' . $cid : ' (CID UNKNOWN)'));
     }
 
     /**
-     * 清除所有页面缓存
+     * 清理内容缓存
      *
+     * @param int    $cid        内容 ID；大于 0 时只清理该内容的缓存，
+     *                           小于等于 0 时作为兜底清理全部单篇缓存
+     * @param bool   $clearLists 是否一并清理列表页缓存
+     * @param string $reason     写入日志的原因说明
      * @return void
      * @throws PluginException
      */
-    private static function flushPageCache(): void
+    private static function purgeCache(int $cid, bool $clearLists, string $reason): void
     {
         $redis = self::initRedis();
         if (!$redis) {
             return;
         }
 
-        $keysArrays = array_merge(
-            $redis->keys(self::$prefix . 'post:*') ?: [],
-            $redis->keys(self::$prefix . 'page:*') ?: []
-        );
+        $scope   = $cid > 0 ? $cid . ':*' : '*';
+        $deleted = self::deleteByPattern($redis, self::$prefix . 'post:' . $scope)
+            + self::deleteByPattern($redis, self::$prefix . 'page:' . $scope);
 
-        if (!empty($keysArrays)) {
-            $redis->del($keysArrays);
+        if ($clearLists) {
+            $deleted += self::deleteByPattern($redis, self::$prefix . 'list:*');
+        }
 
-            $config = Helper::options()->plugin(basename(__DIR__));
+        if ($deleted <= 0) {
+            return;
+        }
 
-            if (isset($config->debug) && $config->debug == '1') {
-                self::writeLog(
-                    'cache-' . date('Y-m-d') . '.log',
-                    date('[Y-m-d H:i:s]') . ' CACHE: (VACATED) REASON: (ARTICLE CONTENT UPDATED)                          SUM: (TOTAL '. count($keysArrays) . ' KEYs)'
-                );
-            }
+        $config = Helper::options()->plugin(basename(__DIR__));
+
+        if (isset($config->debug) && $config->debug == '1') {
+            self::writeLog(
+                'cache-' . date('Y-m-d') . '.log',
+                date('[Y-m-d H:i:s]') . ' CACHE: (VACATED) REASON: '
+                    . str_pad('(' . $reason . ')', 50)
+                    . 'SUM: (TOTAL ' . $deleted . ' KEYs)'
+            );
         }
     }
 }
