@@ -544,6 +544,21 @@ class Plugin implements PluginInterface
     }
 
     /**
+     * 判断当前请求方法是否可以走缓存
+     *
+     * 只有 HTTP 安全方法（GET / HEAD）才允许读写缓存。
+     * POST / PUT / DELETE 等写请求必须走完整渲染流程，
+     * 否则会被 beforeRender 直接吐缓存并 exit()，导致表单提交被静默吞掉。
+     *
+     * @return bool
+     */
+    private static function isCacheableRequestMethod(): bool
+    {
+        $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+        return $method === 'GET' || $method === 'HEAD';
+    }
+
+    /**
      * 在渲染前检查缓存是否存在
      *
      * @param Archive $archive
@@ -553,6 +568,11 @@ class Plugin implements PluginInterface
      */
     public static function beforeRender(Archive $archive): void
     {
+        // 非安全方法（POST 等）不读缓存，交还给原始渲染流程
+        if (!self::isCacheableRequestMethod()) {
+            return;
+        }
+
         $user = User::alloc();
         if ($user->hasLogin()) {
             return;
