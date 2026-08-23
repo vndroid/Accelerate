@@ -700,6 +700,33 @@ class Plugin implements PluginInterface
     }
 
     /**
+     * 提取并校验当前请求的路径部分
+     *
+     * 不使用 parse_url()：当 REQUEST_URI 以 // 开头时，parse_url 会按「协议相对
+     * URL」解析，把 //evil.com/12.html 的路径识别成 /12.html，于是畸形请求会与
+     * 正常页面命中同一个缓存键 —— 这是一条缓存投毒路径。实测：
+     *
+     *   parse_url('//evil.com/12.html', PHP_URL_PATH)  =>  '/12.html'
+     *   parse_url('///etc/passwd',      PHP_URL_PATH)  =>  false
+     *
+     * 因此这里改为手工截取，并要求路径必须是以单个斜杠开头、且不含连续斜杠的
+     * 绝对路径。连续斜杠本就不是 Typecho 会生成的规范链接，多半来自扫描器探测。
+     *
+     * @return string|null 合法路径；畸形请求返回 null
+     */
+    private static function resolveRequestPath(): ?string
+    {
+        $uri  = $_SERVER['REQUEST_URI'] ?? '/';
+        $path = explode('?', $uri, 2)[0];
+
+        if ($path === '' || $path[0] !== '/' || str_contains($path, '//')) {
+            return null;
+        }
+
+        return $path;
+    }
+
+    /**
      * 判断当前请求本身是否可以参与缓存
      *
      * 这里只依据 HTTP 请求与 Typecho 核心的行为做判断，不涉及任何具体主题，
@@ -756,6 +783,11 @@ class Plugin implements PluginInterface
             return;
         }
 
+        $requestUri = self::resolveRequestPath();
+        if ($requestUri === null) {
+            return;
+        }
+
         $user = User::alloc();
         if ($user->hasLogin()) {
             return;
@@ -768,8 +800,7 @@ class Plugin implements PluginInterface
         //       = 'yourCallback';
         //
         // 回调签名：function (bool $skip, Archive $archive, string $requestUri): bool
-        $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
-        if (\Typecho\Plugin::factory(self::class)->filter('skipCache', false, $archive, $requestPath)) {
+        if (\Typecho\Plugin::factory(self::class)->filter('skipCache', false, $archive, $requestUri)) {
             return;
         }
 
@@ -778,7 +809,6 @@ class Plugin implements PluginInterface
             return;
         }
 
-        $requestUri    = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
         $cacheKey      = self::makeCacheKey($requestUri, $archive);
         $cachedContent = $redis->get($cacheKey);
 
@@ -795,6 +825,15 @@ class Plugin implements PluginInterface
             $cachedContent .= "\n<!-- Powered by Redis, TIME: " .
                 date('Y-m-d H:i:s', time() - $redis->ttl($cacheKey)) .
                 ', TTL: ' . $redis->ttl($cacheKey) . 's -->';
+
+            // Typecho 的 Response 只把响应头存进数组，要等 respond() 才真正发送
+            // （见 Typecho\Response::setHeader / sendHeaders）。这里直接 exit()
+            // 会跳过全部响应头 —— 包括 Widget\Init 设置的 Content-Type（站点配置的
+            // 内容类型与字符集）和 Archive::render() 设置的 X-Pingback。
+            // 此前能正常显示，只是碰巧依赖了 PHP 的 default_charset 兜底。
+            if (!headers_sent()) {
+                \Typecho\Response::getInstance()->sendHeaders();
+            }
 
             echo $cachedContent;
             exit();
@@ -833,8 +872,13 @@ class Plugin implements PluginInterface
             return;
         }
 
-        $requestUri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
-        $config     = Helper::options()->plugin(basename(__DIR__));
+        $requestUri = self::resolveRequestPath();
+        if ($requestUri === null) {
+            ob_end_flush();
+            return;
+        }
+
+        $config = Helper::options()->plugin(basename(__DIR__));
 
         // URI 前缀筛选：读取配置中的路径前缀，只缓存匹配的页面
         $rawPrefixes = isset($config->uriPrefix) ? trim($config->uriPrefix) : '/';
@@ -882,17 +926,15 @@ class Plugin implements PluginInterface
             }
         }
 
-        // 检查路径中是否存在较深嵌套（多于两个斜杠），如果存在则跳过缓存
-        if (substr_count($requestUri, '/') > 2) {
-            if (isset($config->debug) && $config->debug == '1') {
-                self::writeLog(
-                    'cache-' . date('Y-m-d') . '.log',
-                    date('[Y-m-d H:i:s]') . ' CACHE: (PASS)    REASON: (URI WITH MULTIPLE SLASHES)                        URI: (' . $requestUri . ')'
-                );
-            }
-            ob_end_flush();
-            return;
-        }
+        // 原先这里用 substr_count($requestUri, '/') > 2 跳过「较深嵌套」的路径。
+        // 该规则误伤面过大：Typecho 的默认固定链接 /archives/1/ 是 3 个斜杠、
+        // 日期型 /2026/08/23/title.html 是 4 个、分类页 /category/tech/ 是 3 个，
+        // 全部被排除在缓存之外 —— 实际上只有 .html 后缀这一种链接形式能被缓存。
+        //
+        // 从提交历史看，当初的意图是拦截「畸形的连续斜杠」（日志原文写的是
+        // multiple slashes detected），而不是限制路径深度。该校验现已前移到
+        // resolveRequestPath()，用 str_contains($path, '//') 精确判断，
+        // 因此这里不再需要按斜杠总数拦截。
 
         $content = ob_get_clean();
         if ($content === false) {
