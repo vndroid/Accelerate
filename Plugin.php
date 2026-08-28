@@ -223,7 +223,7 @@ class Plugin implements PluginInterface
             null,
             '',
             _t('站点标识'),
-            _t('可选。缓存键名固定以 <code>plugin:accelerate:</code> 开头；同一个 Redis 库同时跑多个 Typecho 站点时，在此填写站点标识加以区分，键名将变为 <code>plugin:accelerate:{标识}:post:{cid}:{hash}</code>。只允许字母、数字、下划线与连字符，留空表示不加标识')
+            _t('可选。同一个 Redis 库同时承载多个站点时，在此填写站点标识加以区分，键名将变为 <code>plugin:accelerate:{标识}:post:{cid}:{hash}</code>。只允许字母、数字、下划线与连字符，默认不加标识')
         );
         $form->addInput($siteTag);
 
