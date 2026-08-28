@@ -23,11 +23,11 @@ if (!defined('__TYPECHO_ROOT_DIR__')) {
 }
 
 /**
- * 静态资源缓存插件 via Redis for Typecho
+ * 页面缓存插件 via Redis for Typecho
  *
  * @package Accelerate
  * @author Vex
- * @version 0.1.0
+ * @version 0.1.1
  * @link https://github.com/vndroid/Accelerate
  */
 class Plugin implements PluginInterface
@@ -101,7 +101,7 @@ class Plugin implements PluginInterface
         Helper::addPanel(3, 'Accelerate/Panel.php', _t('缓存管理'), _t('文章缓存清单'), 'administrator');
 
         $configLink = '<a href="' . Helper::options()->adminUrl('options-plugin.php?config=Accelerate', true) . '">' . _t('前往设置') . '</a>';
-        return _t('插件已启用，但缓存功能未启用，请检查缓存 URI ，') . $configLink;
+        return _t('插件已启用，但缓存功能未启用，请检查服务 URI ，') . $configLink;
     }
 
     /**
@@ -150,7 +150,7 @@ class Plugin implements PluginInterface
             ['1' => _t('启用'), '0' => _t('禁用')],
             '0',
             _t('启用缓存'),
-            _t('是否启用 Redis 缓存功能')
+            _t('是否启用缓存功能')
         );
         $form->addInput($enableCache);
 
@@ -159,7 +159,7 @@ class Plugin implements PluginInterface
             null,
             '127.0.0.1',
             _t('Redis 服务地址'),
-            _t('输入 Redis 服务主机地址，默认 HOST 为 127.0.0.1')
+            _t('输入 Redis 服务主机地址，默认为 127.0.0.1')
         );
         $form->addInput($host);
 
@@ -168,7 +168,7 @@ class Plugin implements PluginInterface
             null,
             '6379',
             _t('Redis 服务端口'),
-            _t('输入 Redis 服务端口，默认 PORT 为 6379')
+            _t('输入 Redis 服务端口，默认为 6379')
         );
         $form->addInput($port);
 
