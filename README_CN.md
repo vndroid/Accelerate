@@ -1,4 +1,4 @@
-# RedisCache
+# Accelerate
 
 一款 Typecho 缓存插件。
 
@@ -15,7 +15,7 @@
 
 ### 使用方法
 
-下载压缩包或者克隆项目到插件目录 `usr/plugins/`，插件目录名必须为 `RedisCache`，然后在后台开启插件即可。
+下载压缩包或者克隆项目到插件目录 `usr/plugins/`，插件目录名必须为 `Accelerate`，然后在后台开启插件即可。
 
 ### 更新方法
 
@@ -32,6 +32,6 @@ git pull --rebase
 感谢所有贡献者：
 
 <br>
-<a href="https://github.com/vndroid/RedisCache/graphs/contributors">
-<img src="https://contrib.rocks/image?repo=vndroid/RedisCache" alt="contributors"/>
+<a href="https://github.com/vndroid/Accelerate/graphs/contributors">
+<img src="https://contrib.rocks/image?repo=vndroid/Accelerate" alt="contributors"/>
 </a>

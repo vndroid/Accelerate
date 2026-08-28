@@ -1,4 +1,4 @@
-# RedisCache
+# Accelerate
 
 A Redis cache plug-in for Typecho.
 
@@ -15,7 +15,7 @@ Current language: **English** | [简体中文](/README_CN.md)
 
 ### Usage
 
-Download the source code or git clone to `usr/plugins/`, plug-in diractory name MUST be `RedisCache`, then activate the plug-in in admin panel.
+Download the source code or git clone to `usr/plugins/`, plug-in diractory name MUST be `Accelerate`, then activate the plug-in in admin panel.
 
 ### Update
 
@@ -32,6 +32,6 @@ git pull --rebase
 Thanks to all contributors:
 
 <br>
-<a href="https://github.com/vndroid/RedisCache/graphs/contributors">
-<img src="https://contrib.rocks/image?repo=vndroid/RedisCache" alt="contributors"/>
+<a href="https://github.com/vndroid/Accelerate/graphs/contributors">
+<img src="https://contrib.rocks/image?repo=vndroid/Accelerate" alt="contributors"/>
 </a>

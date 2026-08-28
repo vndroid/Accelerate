@@ -1,6 +1,6 @@
 <?php
 
-namespace TypechoPlugin\RedisCache;
+namespace TypechoPlugin\Accelerate;
 
 use Redis;
 use Throwable;
@@ -25,10 +25,10 @@ if (!defined('__TYPECHO_ROOT_DIR__')) {
 /**
  * 静态资源缓存插件 via Redis for Typecho
  *
- * @package RedisCache
+ * @package Accelerate
  * @author Vex
  * @version 0.1.0
- * @link https://github.com/vndroid/RedisCache
+ * @link https://github.com/vndroid/Accelerate
  */
 class Plugin implements PluginInterface
 {
@@ -77,8 +77,8 @@ class Plugin implements PluginInterface
             throw new PluginException(_t('检测到当前 PHP 环境缺失 redis 扩展'));
         }
         // 检查插件目录名称
-        if (!str_ends_with(trim(__DIR__, '/\\'), 'RedisCache')) {
-            throw new PluginException(_t('插件目录名必须为 RedisCache（区分大小写），请检查插件目录名是否正确'));
+        if (!str_ends_with(trim(__DIR__, '/\\'), 'Accelerate')) {
+            throw new PluginException(_t('插件目录名必须为 Accelerate（区分大小写），请检查插件目录名是否正确'));
         }
         // 在内容渲染前尝试从缓存获取
         Archive::pluginHandle()->beforeRender = [self::class, 'beforeRender'];
@@ -98,9 +98,9 @@ class Plugin implements PluginInterface
         \Typecho\Plugin::factory('admin/footer.php')->begin = [self::class, 'injectFooterJs'];
         \Typecho\Plugin::factory('admin/menu.php')->navBar = [self::class, 'addAdminPageBar'];
 
-        Helper::addPanel(3, 'RedisCache/Panel.php', _t('缓存管理'), _t('文章缓存清单'), 'administrator');
+        Helper::addPanel(3, 'Accelerate/Panel.php', _t('缓存管理'), _t('文章缓存清单'), 'administrator');
 
-        $configLink = '<a href="' . Helper::options()->adminUrl('options-plugin.php?config=RedisCache', true) . '">' . _t('前往设置') . '</a>';
+        $configLink = '<a href="' . Helper::options()->adminUrl('options-plugin.php?config=Accelerate', true) . '">' . _t('前往设置') . '</a>';
         return _t('插件已启用，但缓存功能未启用，请检查缓存 URI ，') . $configLink;
     }
 
@@ -111,7 +111,7 @@ class Plugin implements PluginInterface
      */
     public static function deactivate(): string
     {
-        Helper::removePanel(3, 'RedisCache/Panel.php');
+        Helper::removePanel(3, 'Accelerate/Panel.php');
 
         $config = Helper::options()->plugin(basename(__DIR__));
         $shouldCleanCache = !isset($config->cleanCacheOnDeactivate) || $config->cleanCacheOnDeactivate == '1';
@@ -295,7 +295,7 @@ class Plugin implements PluginInterface
      */
     public static function injectFooterJs(): void
     {
-        // 仅在本插件配置页注入：先确认是插件配置页，再确认是 RedisCache
+        // 仅在本插件配置页注入：先确认是插件配置页，再确认是 Accelerate
         $requestUri = $_SERVER['REQUEST_URI'] ?? '';
         if (!str_contains($requestUri, 'options-plugin.php') || ($_GET['config'] ?? '') !== basename(__DIR__)) {
             return;
@@ -796,7 +796,7 @@ class Plugin implements PluginInterface
         // 扩展点：允许主题或其他插件否决本次缓存，用于处理插件无法感知的
         // 主题级动态内容。注册方式（例如在主题的 themeInit 中）：
         //
-        //   \Typecho\Plugin::factory('TypechoPlugin\RedisCache\Plugin')->skipCache
+        //   \Typecho\Plugin::factory('TypechoPlugin\Accelerate\Plugin')->skipCache
         //       = 'yourCallback';
         //
         // 回调签名：function (bool $skip, Archive $archive, string $requestUri): bool
@@ -1010,8 +1010,8 @@ class Plugin implements PluginInterface
      * 供主题或其他插件在自身配置变更后主动调用，例如主题轮换了第三方服务的
      * 站点密钥、切换了会影响所有页面的开关时：
      *
-     *   if (class_exists('\TypechoPlugin\RedisCache\Plugin')) {
-     *       \TypechoPlugin\RedisCache\Plugin::flushAll('RECAPTCHA KEY ROTATED');
+     *   if (class_exists('\TypechoPlugin\Accelerate\Plugin')) {
+     *       \TypechoPlugin\Accelerate\Plugin::flushAll('RECAPTCHA KEY ROTATED');
      *   }
      *
      * 用 class_exists 保护即可，调用方不会因为未安装本插件而报错。
