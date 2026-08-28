@@ -41,8 +41,18 @@ class Plugin implements PluginInterface
      *
      * v1: {prefix}post:{md5} / {prefix}page:{md5}
      * v2: {prefix}{post|page|list}:{id}:{md5}
+     * v3: 前缀规范化为 plugin:accelerate:[{siteTag}:]，键形态与 v2 相同
      */
-    private const SCHEMA_VERSION = '2';
+    private const SCHEMA_VERSION = '3';
+
+    /**
+     * 缓存键命名空间（硬编码，不可配置）
+     *
+     * 与 Typecho 存放插件配置的 options 行名 plugin:Accelerate 沿用同一套命名习惯，
+     * 便于在 Redis GUI 里按 : 建树浏览，也便于一眼区分本插件与其他应用的键。
+     * 可选的站点标识由配置项 siteTag 追加在其后。
+     */
+    private const NAMESPACE_PREFIX = 'plugin:accelerate:';
 
     /**
      * 初始化实例
@@ -50,7 +60,7 @@ class Plugin implements PluginInterface
     private static ?Redis $redis = null;
 
     /**
-     * 统一缓存前缀
+     * 当前生效的完整缓存键前缀（命名空间 + 可选站点标识），由 makePrefix() 计算
      */
     private static string $prefix = '';
 
@@ -208,14 +218,14 @@ class Plugin implements PluginInterface
         );
         $form->addInput($pageExpire);
 
-        $prefix = new Text(
-            'prefix',
+        $siteTag = new Text(
+            'siteTag',
             null,
-            'typecho_cache:',
-            _t('缓存前缀'),
-            _t('缓存键名的前缀，用于区分不同应用的缓存')
+            '',
+            _t('站点标识'),
+            _t('可选。缓存键名固定以 <code>plugin:accelerate:</code> 开头；同一个 Redis 库同时跑多个 Typecho 站点时，在此填写站点标识加以区分，键名将变为 <code>plugin:accelerate:{标识}:post:{cid}:{hash}</code>。只允许字母、数字、下划线与连字符，留空表示不加标识')
         );
-        $form->addInput($prefix);
+        $form->addInput($siteTag);
 
         $uriPrefix = new Text(
             'uriPrefix',
@@ -328,7 +338,7 @@ class Plugin implements PluginInterface
         }
 
         // 设置缓存参数，配置为空时使用默认值
-        self::$prefix     = $config->prefix     ?: 'typecho_cache:';
+        self::$prefix     = self::makePrefix($config->siteTag ?? '');
         self::$postExpire = intval($config->postExpire) ?: 86400;
         self::$pageExpire = intval($config->pageExpire) ?: 2592000;
 
@@ -536,6 +546,45 @@ class Plugin implements PluginInterface
                 return;
             }
         }
+    }
+
+    /**
+     * 计算当前生效的缓存键前缀
+     *
+     * 命名空间恒为 NAMESPACE_PREFIX；站点标识为可选段，只在同一 Redis 库
+     * 跑多个 Typecho 站点时才需要填写。标识经白名单清洗，避免用户输入的
+     * 冒号、空格、通配符污染键结构或干扰 SCAN 的 MATCH 模式。
+     *
+     * @param string|null $siteTag 用户填写的站点标识（未经清洗）
+     * @return string 以冒号结尾的完整前缀
+     */
+    private static function makePrefix(?string $siteTag): string
+    {
+        $tag = preg_replace('/[^A-Za-z0-9_-]/', '', trim((string) $siteTag));
+
+        return $tag === '' ? self::NAMESPACE_PREFIX : self::NAMESPACE_PREFIX . $tag . ':';
+    }
+
+    /**
+     * 返回当前生效的缓存键前缀（公开 API，供 Panel.php 及第三方调用）
+     *
+     * initRedis() 成功后 self::$prefix 已就绪；若缓存被禁用导致 initRedis()
+     * 提前返回，则此处直接读配置补算一次，保证 Panel 列出的键与实际写入一致。
+     *
+     * @return string
+     */
+    public static function getPrefix(): string
+    {
+        if (self::$prefix === '') {
+            try {
+                $config = Helper::options()->plugin(basename(__DIR__));
+                self::$prefix = self::makePrefix($config->siteTag ?? '');
+            } catch (Throwable $e) {
+                return self::NAMESPACE_PREFIX;
+            }
+        }
+
+        return self::$prefix;
     }
 
     /**

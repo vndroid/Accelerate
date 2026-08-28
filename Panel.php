@@ -7,7 +7,7 @@ use Utils\Helper;
 
 $redis = Plugin::initRedis();
 $config = Helper::options()->plugin('Accelerate');
-$prefix = isset($config->prefix) ? $config->prefix : 'typecho_cache:';
+$prefix = Plugin::getPrefix();
 
 // Handle delete action
 if (isset($_POST['do']) && $_POST['do'] === 'delete' && !empty($_POST['keys'])) {
@@ -16,7 +16,7 @@ if (isset($_POST['do']) && $_POST['do'] === 'delete' && !empty($_POST['keys'])) 
         $count = $redis->del($keysToDelete);
         \Widget\Notice::alloc()->set(_t('成功删除 %d 条缓存', $count), 'success');
     }
-    \Typecho\Response::alloc()->redirect(Helper::options()->adminUrl . 'extending.php?panel=Accelerate%2Fpanel.php');
+    \Typecho\Response::alloc()->redirect(Helper::options()->adminUrl . 'extending.php?panel=Accelerate%2FPanel.php');
 }
 
 $keys = $redis ? $redis->keys($prefix . '*') : [];
@@ -84,7 +84,7 @@ if ($keys) {
                                 <div class="btn-group btn-drop">
                                     <button class="btn dropdown-toggle btn-s" type="button"><i class="sr-only"><?php _e('操作'); ?></i><?php _e('选中项'); ?> <i class="i-caret-down"></i></button>
                                     <ul class="dropdown-menu">
-                                        <li><a lang="<?php _e('确认要删除这些缓存吗?'); ?>" href="<?php echo Helper::options()->adminUrl . 'extending.php?panel=Accelerate%2Fpanel.php'; ?>" class="operate-delete"><?php _e('删除'); ?></a></li>
+                                        <li><a lang="<?php _e('确认要删除这些缓存吗?'); ?>" href="<?php echo Helper::options()->adminUrl . 'extending.php?panel=Accelerate%2FPanel.php'; ?>" class="operate-delete"><?php _e('删除'); ?></a></li>
                                     </ul>
                                 </div>
                             </div>
