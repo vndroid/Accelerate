@@ -5,7 +5,9 @@ include 'menu.php';
 use TypechoPlugin\Accelerate\Plugin;
 use Utils\Helper;
 
-$redis = Plugin::initRedis();
+// 传 true 忽略 enableCache 开关：缓存被关掉之后，管理页仍然要能列出并清理存量数据，
+// 否则这里会误报成「Redis 连接失败」。
+$redis = Plugin::initRedis(true);
 $config = Helper::options()->plugin('Accelerate');
 $prefix = Plugin::getPrefix();
 

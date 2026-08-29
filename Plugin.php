@@ -16,6 +16,7 @@ use Widget\Archive;
 use Widget\User;
 use Widget\Contents\Post\Edit as PostEdit;
 use Widget\Contents\Page\Edit as PageEdit;
+use Widget\Comments\Edit as CommentsEdit;
 use Widget\Feedback;
 
 if (!defined('__TYPECHO_ROOT_DIR__')) {
@@ -58,9 +59,26 @@ class Plugin implements PluginInterface
     private const NAMESPACE_PREFIX = 'plugin:accelerate:';
 
     /**
+     * Redis 连接与读写超时（秒）
+     *
+     * 缓存是「可选加速层」，宁可放弃加速也不该让访客为一个不可达的 Redis 干等。
+     * phpredis 的默认读超时是 0（无限期阻塞），必须显式设置。
+     */
+    private const CONNECT_TIMEOUT = 1.0;
+    private const READ_TIMEOUT    = 1.0;
+
+    /**
      * 初始化实例
      */
     private static ?Redis $redis = null;
+
+    /**
+     * 本次请求内 Redis 是否已经确认不可用
+     *
+     * 单个请求里 beforeRender / afterRender / purgeCache 都会调 initRedis()，
+     * 不记忆失败的话，Redis 挂掉时每个调用点都要重新吃一遍 connect 超时。
+     */
+    private static bool $initFailed = false;
 
     /**
      * 当前生效的完整缓存键前缀（命名空间 + 可选站点标识），由 makePrefix() 计算
@@ -99,14 +117,33 @@ class Plugin implements PluginInterface
         // 在内容渲染后缓存内容
         Archive::pluginHandle()->afterRender = [self::class, 'afterRender'];
 
-        // 当文章更新时清除缓存
+        // 当文章 / 页面发布或更新时清除缓存
         PostEdit::pluginHandle()->finishPublish = [self::class, 'clearCacheOnPublish'];
-
-        // 当页面更新时清除缓存
         PageEdit::pluginHandle()->finishPublish = [self::class, 'clearCacheOnPublish'];
 
-        // 当评论提交时清除缓存
+        // 当内容被删除时清除缓存。
+        // 不挂的话，已删除的文章最长还能从 Redis 公开访问 postExpire（默认一天），
+        // 独立页面最长 pageExpire（默认一月）—— 内容都没了，缓存还在对外服务。
+        PostEdit::pluginHandle()->finishDelete = [self::class, 'clearCacheOnContentDelete'];
+        PageEdit::pluginHandle()->finishDelete = [self::class, 'clearCacheOnContentDelete'];
+
+        // 当内容被标记为隐藏 / 私密 / 待审核时清除缓存。
+        // Typecho 的状态变更走的是 markPost()/markPage()，不经过 finishPublish。
+        PostEdit::pluginHandle()->finishMark = [self::class, 'clearCacheOnContentMark'];
+        PageEdit::pluginHandle()->finishMark = [self::class, 'clearCacheOnContentMark'];
+
+        // 前台评论提交时清除缓存
         Feedback::pluginHandle()->finishComment = [self::class, 'clearCacheOnComment'];
+
+        // 后台评论操作时清除缓存。
+        // 注意 Widget\Comments\Edit 与 Widget\Feedback 是两个不同的类：后台「回复评论」
+        // 触发的是前者的 finishComment，前台访客评论触发的是后者，必须分别挂。
+        // 另外评论只有 mark 没有 finishMark ——「通过 / 待审核 / 垃圾」三个操作都走 mark，
+        // 且它在 UPDATE 之前触发（见 var/Widget/Comments/Edit.php::mark）。
+        CommentsEdit::pluginHandle()->mark          = [self::class, 'clearCacheOnCommentMark'];
+        CommentsEdit::pluginHandle()->finishDelete  = [self::class, 'clearCacheOnCommentDelete'];
+        CommentsEdit::pluginHandle()->finishEdit    = [self::class, 'clearCacheOnCommentTouch'];
+        CommentsEdit::pluginHandle()->finishComment = [self::class, 'clearCacheOnCommentTouch'];
 
         \Typecho\Plugin::factory('admin/footer.php')->begin = [self::class, 'injectFooterJs'];
         \Typecho\Plugin::factory('admin/menu.php')->navBar = [self::class, 'addAdminPageBar'];
@@ -132,7 +169,9 @@ class Plugin implements PluginInterface
         $cleanCount = 0;
 
         if ($shouldCleanCache) {
-            $redis = self::initRedis();
+            // 传 true 忽略 enableCache 开关：用户先在设置里关掉缓存、再停用插件时，
+            // 旧缓存同样需要按「禁用时清理」的选择被清掉。
+            $redis = self::initRedis(true);
             if ($redis) {
                 $cleanCount = self::deleteByPattern($redis, self::$prefix . '*');
             }
@@ -324,19 +363,28 @@ class Plugin implements PluginInterface
     /**
      * 初始化 Redis 连接
      *
+     * @param bool $ignoreSwitch 忽略 enableCache 开关。供「管理与清理」场景使用：
+     *                           停用插件时清缓存、后台缓存管理页。这两处即使用户
+     *                           已经关掉缓存，也必须能连上去处理存量数据。
      * @return Redis|null
      * @throws PluginException
      */
-    public static function initRedis(): ?Redis
+    public static function initRedis(bool $ignoreSwitch = false): ?Redis
     {
         if (self::$redis !== null) {
             return self::$redis;
         }
 
+        // 本次请求内已经确认不可用就不再重试，避免每个调用点各吃一遍连接超时
+        if (self::$initFailed) {
+            return null;
+        }
+
         $config = Helper::options()->plugin(basename(__DIR__));
 
-        // 如果禁用缓存，直接返回
-        if (isset($config->enableCache) && $config->enableCache == '0') {
+        // 如果禁用缓存，直接返回。这里不置 $initFailed —— 缓存被禁用不是连接失败，
+        // 同一请求里随后带 $ignoreSwitch 的调用仍然应该能连上。
+        if (!$ignoreSwitch && isset($config->enableCache) && $config->enableCache == '0') {
             return null;
         }
 
@@ -349,13 +397,23 @@ class Plugin implements PluginInterface
         $logFilename = 'redis-' . date('Y-m-d') . '.log';
 
         try {
-            // 尝试连接 Redis
+            // 尝试连接 Redis。第 6 个参数是读超时 —— phpredis 默认 0（无限期阻塞），
+            // 一个卡住的 Redis 会把请求一起挂死，必须显式设置。
             $redis     = new Redis();
-            $connected = $redis->connect($config->host, intval($config->port), 3);
+            $connected = $redis->connect(
+                $config->host,
+                intval($config->port),
+                self::CONNECT_TIMEOUT,
+                null,
+                0,
+                self::READ_TIMEOUT
+            );
 
             if (!$connected) {
                 throw new \Exception('无法连接到 Redis 服务');
             }
+
+            $redis->setOption(Redis::OPT_READ_TIMEOUT, self::READ_TIMEOUT);
 
             // 如果设置了密码，进行验证
             if (!empty($config->password)) {
@@ -417,8 +475,42 @@ class Plugin implements PluginInterface
             self::$redis = $redis;
             return $redis;
         } catch (Throwable $e) {
+            self::$initFailed = true;
             self::writeLog($logFilename, date('[Y-m-d H:i:s]') . ' redis connect failed: ' . $e->getMessage());
             return null;
+        }
+    }
+
+    /**
+     * 执行一次 Redis 调用，失败时降级而不是把异常抛给 Typecho
+     *
+     * 原先只有连接初始化过程有容错，后续的 get / ttl / setex / scan / del 全都裸奔。
+     * phpredis 在连接中途断开、内存写满、连到只读副本等情况下会抛 RedisException，
+     * 未捕获就会被 Typecho 渲染成异常页 —— 一个「可选加速层」不该有能力让正常
+     * 页面渲染失败。约定：读取失败等价于未命中，写入与清理失败只记日志。
+     *
+     * 失败后顺手把连接标记为不可用。坏掉的连接在同一个请求里不会自愈，
+     * 继续拿它去调只会在后续每个调用点再抛一次。
+     *
+     * @param callable $operation 实际的 Redis 调用
+     * @param mixed    $fallback  失败时的返回值
+     * @param string   $what      写进日志的操作名
+     * @return mixed
+     */
+    private static function attempt(callable $operation, $fallback, string $what)
+    {
+        try {
+            return $operation();
+        } catch (Throwable $e) {
+            self::$redis      = null;
+            self::$initFailed = true;
+
+            self::writeLog(
+                'redis-' . date('Y-m-d') . '.log',
+                date('[Y-m-d H:i:s]') . ' ' . $what . ' failed: ' . $e->getMessage()
+            );
+
+            return $fallback;
         }
     }
 
@@ -656,20 +748,30 @@ class Plugin implements PluginInterface
      */
     private static function deleteByPattern(Redis $redis, string $pattern): int
     {
-        $deleted  = 0;
-        $iterator = null;
-
-        // SCAN_RETRY：某一轮没有匹配结果时由 phpredis 自动继续迭代，
-        // 迭代结束时返回 false，因此可以安全地用 while 取值
-        $redis->setOption(Redis::OPT_SCAN, Redis::SCAN_RETRY);
-
-        while (($keys = $redis->scan($iterator, $pattern, 500)) !== false) {
-            if (!empty($keys)) {
-                $deleted += intval($redis->del($keys));
-            }
+        // purgeCache() 一次会连调本函数 2~3 次。首次失败后连接已被标记为不可用，
+        // 后面几次没必要再各抛一次异常、各写一行日志。
+        if (self::$initFailed) {
+            return 0;
         }
 
-        return $deleted;
+        // 整段包在 attempt() 里：清理失败只记日志，绝不能让发布文章、提交评论
+        // 这些核心操作因为 Redis 出问题而报错。
+        return intval(self::attempt(function () use ($redis, $pattern) {
+            $deleted  = 0;
+            $iterator = null;
+
+            // SCAN_RETRY：某一轮没有匹配结果时由 phpredis 自动继续迭代，
+            // 迭代结束时返回 false，因此可以安全地用 while 取值
+            $redis->setOption(Redis::OPT_SCAN, Redis::SCAN_RETRY);
+
+            while (($keys = $redis->scan($iterator, $pattern, 500)) !== false) {
+                if (!empty($keys)) {
+                    $deleted += intval($redis->del($keys));
+                }
+            }
+
+            return $deleted;
+        }, 0, 'cache purge (' . $pattern . ')'));
     }
 
     /**
@@ -957,9 +1059,15 @@ class Plugin implements PluginInterface
         }
 
         $cacheKey      = self::makeCacheKey($requestUri, $archive);
-        $cachedContent = $redis->get($cacheKey);
+        $cachedContent = self::attempt(
+            fn () => $redis->get($cacheKey),
+            false,
+            'cache read (' . $cacheKey . ')'
+        );
 
-        if ($cachedContent !== false) {
+        // 用 is_string 而不是 !== false：读取失败时 attempt() 也返回 false，
+        // 两种情况都应当按「未命中」处理。
+        if (is_string($cachedContent)) {
             $config = Helper::options()->plugin(basename(__DIR__));
 
             if (isset($config->debug) && $config->debug == '1') {
@@ -969,9 +1077,18 @@ class Plugin implements PluginInterface
                 );
             }
 
-            $cachedContent .= "\n<!-- Powered by Redis, TIME: " .
-                date('Y-m-d H:i:s', time() - $redis->ttl($cacheKey)) .
-                ', TTL: ' . $redis->ttl($cacheKey) . 's -->';
+            // 原先这里输出的 TIME 是 date(..., time() - ttl)，标称「缓存写入时间」
+            // 但算法是错的：刚写入时 ttl 仍等于完整 TTL，算出来会是「一天前」。
+            // 要还原写入时刻得额外存一份原始 TTL，不值得，改为只报剩余存活时间。
+            // 同时这里原本调了两次 ttl()，白白多一次往返。
+            $remaining = intval(self::attempt(
+                fn () => $redis->ttl($cacheKey),
+                0,
+                'cache ttl (' . $cacheKey . ')'
+            ));
+
+            $cachedContent .= "\n<!-- Powered by Redis, SERVED: " . date('Y-m-d H:i:s') .
+                ', TTL: ' . $remaining . 's -->';
 
             // Typecho 的 Response 只把响应头存进数组，要等 respond() 才真正发送
             // （见 Typecho\Response::setHeader / sendHeaders）。这里直接 exit()
@@ -1115,14 +1232,13 @@ class Plugin implements PluginInterface
         // 一个「可选加速层」不该有能力让正常页面渲染失败。
         echo $content;
 
-        try {
-            $redis->setex($cacheKey, $ttl, $content);
-        } catch (Throwable $e) {
-            self::writeLog(
-                'redis-' . date('Y-m-d') . '.log',
-                date('[Y-m-d H:i:s]') . ' cache write failed: ' . $e->getMessage()
-                    . ' KEY: (' . $cacheKey . ')'
-            );
+        $stored = self::attempt(
+            fn () => $redis->setex($cacheKey, $ttl, $content),
+            false,
+            'cache write (' . $cacheKey . ')'
+        );
+
+        if (!$stored) {
             return;
         }
 
@@ -1153,7 +1269,40 @@ class Plugin implements PluginInterface
     }
 
     /**
-     * 评论提交时清除缓存（finishComment 钩子仅传入 $this）
+     * 内容被删除时清除缓存（finishDelete 钩子传入 $cid, $widget）
+     *
+     * Typecho 删除文章/页面走 deletePost()/deletePage()，不经过 finishPublish。
+     * 传入的第一个参数就是 cid 本身（来自 request 的 int 过滤），不是内容数组。
+     *
+     * @param int $cid 被删除内容的 ID
+     * @param PostEdit|PageEdit $widget 编辑组件
+     * @return void
+     * @throws PluginException
+     */
+    public static function clearCacheOnContentDelete(int $cid, PostEdit|PageEdit $widget): void
+    {
+        self::purgeCache($cid, true, 'CONTENT DELETED' . ($cid > 0 ? ' CID ' . $cid : ''));
+    }
+
+    /**
+     * 内容状态变更时清除缓存（finishMark 钩子传入 $status, $cid, $widget）
+     *
+     * 覆盖后台的「公开 / 私密 / 隐藏 / 待审核」标记操作。转为非公开状态后若不清缓存，
+     * 旧的公开版本会继续从 Redis 对外服务直到 TTL 到期。
+     *
+     * @param string $status 新状态
+     * @param int $cid 内容 ID
+     * @param PostEdit|PageEdit $widget 编辑组件
+     * @return void
+     * @throws PluginException
+     */
+    public static function clearCacheOnContentMark(string $status, int $cid, PostEdit|PageEdit $widget): void
+    {
+        self::purgeCache($cid, true, 'CONTENT MARKED ' . strtoupper($status) . ($cid > 0 ? ' CID ' . $cid : ''));
+    }
+
+    /**
+     * 前台评论提交时清除缓存（finishComment 钩子仅传入 $this）
      *
      * Feedback::$content 是私有属性，但评论行此时已经 push 进 widget，
      * 因此 $widget->cid 即为被评论内容的 ID。
@@ -1164,12 +1313,78 @@ class Plugin implements PluginInterface
      */
     public static function clearCacheOnComment(Feedback $widget): void
     {
-        $cid = intval($widget->cid);
+        self::purgeCommentCache(intval($widget->cid), 'NEW COMMENT');
+    }
 
+    /**
+     * 后台标记评论状态时清除缓存（mark 钩子传入 $comment, $widget, $status）
+     *
+     * 「通过 / 待审核 / 垃圾」三个操作都走这里。评论没有 finishMark，
+     * 而 mark 在 UPDATE 之前触发（var/Widget/Comments/Edit.php::mark），
+     * 因此存在一个极窄的窗口：清完缓存、状态尚未落库时若恰好有前台请求，
+     * 会用旧状态重新填充缓存。核心没有提供更靠后的钩子，接受这个窗口。
+     *
+     * @param array $comment 评论行
+     * @param CommentsEdit $widget 评论编辑组件
+     * @param string $status 目标状态
+     * @return void
+     * @throws PluginException
+     */
+    public static function clearCacheOnCommentMark(array $comment, CommentsEdit $widget, string $status): void
+    {
+        self::purgeCommentCache(intval($comment['cid'] ?? 0), 'COMMENT MARKED ' . strtoupper($status));
+    }
+
+    /**
+     * 后台删除评论时清除缓存（finishDelete 钩子传入 $comment, $widget）
+     *
+     * @param array $comment 被删除的评论行
+     * @param CommentsEdit $widget 评论编辑组件
+     * @return void
+     * @throws PluginException
+     */
+    public static function clearCacheOnCommentDelete(array $comment, CommentsEdit $widget): void
+    {
+        self::purgeCommentCache(intval($comment['cid'] ?? 0), 'COMMENT DELETED');
+    }
+
+    /**
+     * 后台编辑评论、回复评论时清除缓存（finishEdit / finishComment 均仅传入 $this）
+     *
+     * 两个钩子触发前评论行都已经 push 进 widget，因此 $widget->cid 可用。
+     * 注意这里的 finishComment 属于 Widget\Comments\Edit（后台回复），
+     * 与 Widget\Feedback::finishComment（前台评论）是两个不同的类。
+     *
+     * @param CommentsEdit $widget 评论编辑组件
+     * @return void
+     * @throws PluginException
+     */
+    public static function clearCacheOnCommentTouch(CommentsEdit $widget): void
+    {
+        self::purgeCommentCache(intval($widget->cid), 'COMMENT EDITED OR REPLIED');
+    }
+
+    /**
+     * 评论类操作的统一清理入口
+     *
+     * 是否连带清理列表页由配置项 clearListOnComment 决定：主题若不在列表页显示
+     * 评论数，保留列表页缓存可以大幅缩小失效范围。
+     *
+     * @param int $cid 被评论内容的 ID
+     * @param string $reason 写入日志的原因说明
+     * @return void
+     * @throws PluginException
+     */
+    private static function purgeCommentCache(int $cid, string $reason): void
+    {
         $config     = Helper::options()->plugin(basename(__DIR__));
         $clearLists = !isset($config->clearListOnComment) || $config->clearListOnComment == '1';
 
-        self::purgeCache($cid, $clearLists, 'NEW COMMENT' . ($cid > 0 ? ' ON CID ' . $cid : ' (CID UNKNOWN)'));
+        self::purgeCache(
+            $cid,
+            $clearLists,
+            $reason . ($cid > 0 ? ' ON CID ' . $cid : ' (CID UNKNOWN)')
+        );
     }
 
     /**
