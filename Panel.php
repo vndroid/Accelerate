@@ -9,22 +9,54 @@ $redis = Plugin::initRedis();
 $config = Helper::options()->plugin('Accelerate');
 $prefix = Plugin::getPrefix();
 
+/** admin/common.php 已注入全局 $security，这里显式取一次，不依赖包含顺序 */
+$security = \Widget\Security::alloc();
+
+/** 本面板自身的地址，同时用作表单 action 与删除后的跳转目标 */
+$panelUrl = Helper::options()->adminUrl . 'extending.php?panel=Accelerate%2FPanel.php';
+
 // Handle delete action
 if (isset($_POST['do']) && $_POST['do'] === 'delete' && !empty($_POST['keys'])) {
+    // 请求防伪。$security 由 admin/common.php 注入全局，令牌里含当前管理员的
+    // authCode 与 uid（见 Widget\Security::execute），因此是逐人绑定的。
+    // 不校验的话，管理员在登录状态下被诱导访问外部页面即可触发批量删除。
+    $security->protect();
+
     if ($redis) {
         $keysToDelete = is_array($_POST['keys']) ? $_POST['keys'] : [$_POST['keys']];
-        $count = $redis->del($keysToDelete);
-        \Widget\Notice::alloc()->set(_t('成功删除 %d 条缓存', $count), 'success');
+
+        // 只允许删除「当前前缀下、且符合内容键格式」的键。
+        // 提交的键名来自表单，未经校验时可以指向同一个 Redis 库里任何其他
+        // 站点或应用的数据，也可以指向本插件的控制键（schema 被删会触发一次
+        // 全量作废迁移）。
+        $validKeys = [];
+        foreach ($keysToDelete as $key) {
+            if (is_string($key) && Plugin::isContentCacheKey($key)) {
+                $validKeys[] = $key;
+            }
+        }
+
+        $count = $validKeys ? intval($redis->del($validKeys)) : 0;
+        $rejected = count($keysToDelete) - count($validKeys);
+
+        \Widget\Notice::alloc()->set(
+            $rejected > 0
+                ? _t('成功删除 %d 条缓存，%d 条键名不合法已忽略', $count, $rejected)
+                : _t('成功删除 %d 条缓存', $count),
+            $rejected > 0 ? 'notice' : 'success'
+        );
     }
-    \Typecho\Response::alloc()->redirect(Helper::options()->adminUrl . 'extending.php?panel=Accelerate%2FPanel.php');
+    \Typecho\Response::alloc()->redirect($panelUrl);
 }
 
 $keys = $redis ? $redis->keys($prefix . '*') : [];
 $cacheItems = [];
 if ($keys) {
     foreach ($keys as $key) {
-        // 跳过控制键：连接测试、键结构版本标记与迁移锁，均不是内容缓存
-        if (in_array($key, [$prefix . 'test', $prefix . 'schema', $prefix . 'schema:lock'], true)) continue;
+        // 只列出内容缓存键。控制键（test / schema / schema:lock）与命名空间外
+        // 的键都会被判否 —— 判定与删除时用的是同一个函数，因此不会出现
+        // 「列表里能看到、点删除却被拒绝」的错位。
+        if (!Plugin::isContentCacheKey($key)) continue;
 
         try {
             $size = $redis->rawCommand('MEMORY', 'USAGE', $key);
@@ -45,14 +77,11 @@ if ($keys) {
         $cid = '';
         $md5Key = $keyWithoutPrefix;
 
-        if (count($parts) === 3 && in_array($parts[0], ['post', 'page', 'list'], true)) {
+        // isContentCacheKey() 已保证形态为 {type}:{id}:{md5}
+        if (count($parts) === 3) {
             $type = $parts[0];
             $cid = $parts[1] === '0' ? '' : $parts[1];
             $md5Key = $parts[2];
-        } elseif (count($parts) === 2 && in_array($parts[0], ['post', 'page'], true)) {
-            // 兼容 0.1.0 及更早版本生成的、不带 cid 的缓存键
-            $type = $parts[0];
-            $md5Key = $parts[1];
         }
 
         $cacheItems[] = [
@@ -84,7 +113,7 @@ if ($keys) {
                                 <div class="btn-group btn-drop">
                                     <button class="btn dropdown-toggle btn-s" type="button"><i class="sr-only"><?php _e('操作'); ?></i><?php _e('选中项'); ?> <i class="i-caret-down"></i></button>
                                     <ul class="dropdown-menu">
-                                        <li><a lang="<?php _e('确认要删除这些缓存吗?'); ?>" href="<?php echo Helper::options()->adminUrl . 'extending.php?panel=Accelerate%2FPanel.php'; ?>" class="operate-delete"><?php _e('删除'); ?></a></li>
+                                        <li><a lang="<?php _e('确认要删除这些缓存吗?'); ?>" href="<?php echo $security->getTokenUrl($panelUrl); ?>" class="operate-delete"><?php _e('删除'); ?></a></li>
                                     </ul>
                                 </div>
                             </div>

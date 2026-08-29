@@ -35,15 +35,18 @@ class Plugin implements PluginInterface
     /**
      * 缓存键结构版本
      *
-     * 当 makeCacheKey() 生成的键名结构发生变化时必须递增此版本号。
-     * 插件会在下一次连接 Redis 时自动清理所有不符合当前结构的历史缓存，
+     * 键名结构发生变化、或存量缓存的内容已不可信时，必须递增此版本号。
+     * 插件会在下一次连接 Redis 时作废当前前缀下的全部内容缓存，
      * 避免旧键既无法命中、又无法被按 cid 精确清理而长期滞留。
      *
      * v1: {prefix}post:{md5} / {prefix}page:{md5}
      * v2: {prefix}{post|page|list}:{id}:{md5}
      * v3: 前缀规范化为 plugin:accelerate:[{siteTag}:]，键形态与 v2 相同
+     * v4: 键形态与 v3 相同。用于作废 v3 期间写入的两类脏缓存：404 页面
+     *     （键名是合法的 list:0:{md5}）与密码保护文章的明文正文，
+     *     两者都无法靠键名形态识别，只能整体作废。
      */
-    private const SCHEMA_VERSION = '3';
+    private const SCHEMA_VERSION = '4';
 
     /**
      * 缓存键命名空间（硬编码，不可配置）
@@ -588,6 +591,30 @@ class Plugin implements PluginInterface
     }
 
     /**
+     * 判断某个键名是否为本插件在当前前缀下写入的内容缓存键（公开 API，供 Panel.php 使用）
+     *
+     * 键名校验集中在这里，避免 Panel 里再抄一份正则而与 makeCacheKey()
+     * 漂移。控制键（test / schema / schema:lock）不符合内容键形态，
+     * 因此会被一并判否 —— 它们既不该展示在缓存清单里，更不该被手工删除。
+     *
+     * @param string $key 完整键名（含前缀）
+     * @return bool
+     */
+    public static function isContentCacheKey(string $key): bool
+    {
+        $prefix = self::getPrefix();
+
+        if (!str_starts_with($key, $prefix)) {
+            return false;
+        }
+
+        return (bool) preg_match(
+            '/^(post|page|list):\d+:[0-9a-f]{32}$/',
+            substr($key, strlen($prefix))
+        );
+    }
+
+    /**
      * 根据内容类型生成缓存键
      *
      * 统一为 {type}:{id}:{hash} 三段式：
@@ -648,7 +675,7 @@ class Plugin implements PluginInterface
     /**
      * 键结构迁移
      *
-     * 用一个哨兵键记录当前使用的键结构版本，版本不匹配时清理全部历史格式缓存。
+     * 用一个哨兵键记录当前使用的结构版本，版本不匹配时作废全部内容缓存。
      *
      * 之所以放在这里而不是 activate()：Typecho 在禁用插件时会一并删除插件配置
      * （var/Widget/Plugins/Edit.php），activate() 执行时拿不到 Redis 连接参数；
@@ -687,20 +714,19 @@ class Plugin implements PluginInterface
     }
 
     /**
-     * 清理所有不符合当前键结构的缓存
+     * 作废当前前缀下的全部内容缓存
      *
-     * 采用「白名单」策略：只保留符合当前结构的内容键与少量控制键，
-     * 其余一律删除。这样将来再次调整键结构时，只需递增 SCHEMA_VERSION，
-     * 无需为每一种历史格式单独编写匹配规则。
+     * 只保留少量控制键，其余一律删除。缓存本身是可丢弃的，「整体作废」
+     * 比「按形态识别历史格式」既更简单也更安全：它同时覆盖两种情况 ——
+     * 键结构变更（旧键无法命中也无法按 cid 清理），以及键名合法但内容
+     * 已不可信（例如 v3 期间写入的 404 页面缓存、密码保护文章明文）。
+     * 将来无论出于哪种原因需要作废缓存，只需递增 SCHEMA_VERSION。
      *
      * @param Redis $redis
      * @return int 实际删除的键数量
      */
     private static function purgeLegacyKeys(Redis $redis): int
     {
-        // 当前内容键结构：{type}:{id}:{md5}
-        $currentShape = '/^(post|page|list):\d+:[0-9a-f]{32}$/';
-
         // 控制键：连接测试、结构版本标记、迁移锁，不属于内容缓存，需保留
         $reserved = ['test', 'schema', 'schema:lock'];
 
@@ -714,7 +740,7 @@ class Plugin implements PluginInterface
             foreach ($keys as $key) {
                 $name = substr($key, strlen(self::$prefix));
 
-                if (in_array($name, $reserved, true) || preg_match($currentShape, $name)) {
+                if (in_array($name, $reserved, true)) {
                     continue;
                 }
 
@@ -804,13 +830,81 @@ class Plugin implements PluginInterface
             return false;
         }
 
-        // 3) 携带 Typecho 评论态 cookie 的请求不缓存。
-        //    评论校验失败或待审核时，Typecho 会写入 __typecho_remember_*、
-        //    __typecho_unapproved_comment 等 cookie，主题可能据此回填表单或
+        // 3) 携带「与该访客绑定」的 Typecho cookie 的请求不缓存。
+        //
+        //    __typecho_remember_* / __typecho_unapproved_comment：
+        //    评论校验失败或待审核时由 Typecho 写入，主题可能据此回填表单或
         //    显示「您的评论正在审核」。这类页面含有该访客的私有内容，
         //    一旦写入缓存就会广播给所有人。
+        //
+        //    protectPassword_{cid}：
+        //    Widget\Base\Contents::___hidden() 用它判断是否输出受保护正文
+        //    （见 var/Widget/Base/Contents.php）。持有该 cookie 的访客看到的是
+        //    全文，不持有的看到的是密码表单 —— 两种都不能进公共缓存。
+        //    放在请求层判断而不是只判断单篇归档，是因为列表页同样会为持有
+        //    cookie 的访客渲染出受保护文章的正文摘要。
+        //    本函数在 beforeRender() 里于「查缓存」之前调用，因此读、写两侧
+        //    同时被阻断：持有密码的访客既不会污染缓存，也不会命中别人的缓存。
         foreach (array_keys($_COOKIE) as $name) {
-            if (str_starts_with($name, '__typecho_remember_') || $name === '__typecho_unapproved_comment') {
+            if (
+                str_starts_with($name, '__typecho_remember_')
+                || $name === '__typecho_unapproved_comment'
+                || str_starts_with($name, 'protectPassword_')
+            ) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 判断当前归档本身是否可以参与缓存
+     *
+     * 与 isCacheableRequest() 的分工：那边只看 HTTP 请求（方法、查询串、
+     * cookie），这边看 Typecho 解析出来的归档对象。两者必须在 beforeRender()
+     * 与 afterRender() 两侧同时生效，否则会出现「开了输出缓冲、却永远写不进
+     * 缓存」的空转。
+     *
+     * @param Archive $archive
+     * @return bool
+     */
+    private static function isCacheableArchive(Archive $archive): bool
+    {
+        $type = $archive->getArchiveType();
+
+        // 1) 404 页面。error404Handle() 是 Widget\Archive 里唯一把 archiveType
+        //    设为 'archive' 的分支，且它照常走 render()，因此 beforeRender /
+        //    afterRender 都会触发 —— 不拦的话，任意随机路径（/random-1、
+        //    /random-2 …）都会各写出一个 list:0:{md5} 键并按 postExpire 存活，
+        //    可以被用来撑爆 Redis 内存。
+        //
+        //    这里不能用 $archive->is('archive')：is() 内部有
+        //    (archiveSingle ? 'single' : 'archive') == $archiveType 的兜底分支，
+        //    分类页、标签页、日期归档同样会返回 true。必须读 getArchiveType()。
+        if ($type === 'archive') {
+            return false;
+        }
+
+        // 2) 归档类型白名单。上面已经点名拦掉 404，这里再要求类型必须是
+        //    Widget\Archive 自身会产出的取值；主题或插件通过 setArchiveType()
+        //    设置的自定义类型一律跳过 —— 宁可少缓存，也不缓存语义未知的页面。
+        static $allowed = [
+            'index', 'front', 'single', 'post', 'page', 'attachment',
+            'category', 'tag', 'author', 'date', 'search',
+        ];
+
+        if (!in_array($type, $allowed, true)) {
+            return false;
+        }
+
+        // 3) 密码保护内容的兜底。带 protectPassword_ cookie 的请求已经在
+        //    isCacheableRequest() 里被挡掉（那条同时覆盖列表页），这里再对单篇
+        //    补一层：未持有密码时页面输出的是密码表单，且 Widget\Archive 会
+        //    setStatus(403)，而本插件命中缓存时是以 200 输出的 —— 缓存它既没有
+        //    收益，又会把 403 变成 200。
+        if ($archive->is('single')) {
+            if (strlen((string) $archive->password) > 0 || $archive->hidden) {
                 return false;
             }
         }
@@ -834,6 +928,10 @@ class Plugin implements PluginInterface
 
         $requestUri = self::resolveRequestPath();
         if ($requestUri === null) {
+            return;
+        }
+
+        if (!self::isCacheableArchive($archive)) {
             return;
         }
 
@@ -927,6 +1025,13 @@ class Plugin implements PluginInterface
             return;
         }
 
+        // 与 beforeRender() 保持一致：归档类型在渲染过程中还可能被主题改写，
+        // 因此这里必须重新判断一次，不能只依赖进入 beforeRender 时的结论。
+        if (!self::isCacheableArchive($archive)) {
+            ob_end_flush();
+            return;
+        }
+
         $config = Helper::options()->plugin(basename(__DIR__));
 
         // URI 前缀筛选：读取配置中的路径前缀，只缓存匹配的页面
@@ -1004,8 +1109,22 @@ class Plugin implements PluginInterface
             }
         }
 
-        $redis->setex($cacheKey, $ttl, $content);
+        // 必须先输出、再写缓存。此时页面内容已经被 ob_get_clean() 从缓冲区
+        // 取走，若先执行 setex() 且 Redis 在此刻抛出 RedisException（连接中途
+        // 断开、内存满、只读副本等），访客拿到的就是一个白页或异常页 ——
+        // 一个「可选加速层」不该有能力让正常页面渲染失败。
         echo $content;
+
+        try {
+            $redis->setex($cacheKey, $ttl, $content);
+        } catch (Throwable $e) {
+            self::writeLog(
+                'redis-' . date('Y-m-d') . '.log',
+                date('[Y-m-d H:i:s]') . ' cache write failed: ' . $e->getMessage()
+                    . ' KEY: (' . $cacheKey . ')'
+            );
+            return;
+        }
 
         if (isset($config->debug) && $config->debug == '1') {
             self::writeLog(
