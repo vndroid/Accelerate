@@ -325,6 +325,180 @@ class Plugin implements PluginInterface
     }
 
     /**
+     * 保存配置前的校验与提示（Typecho 在 configHandle() 之前调用）
+     *
+     * 为什么校验分成 configCheck + configHandle 两半：
+     * configCheck() 的返回值会被 Typecho 设成 Notice 并置 configNoticed，从而抑制
+     * 默认那句「插件设置已经保存」——但它**不会阻止保存**（见
+     * var/Widget/Plugins/Edit.php:118-138）。真正决定要不要落库的是 configHandle()。
+     * 所以提示走这里，拦截走那里，两边共用同一个 validateConfig()。
+     *
+     * @param array $settings 表单提交的配置
+     * @return string|null 提示信息
+     */
+    public static function configCheck(array $settings): ?string
+    {
+        $errors = self::validateConfig($settings);
+
+        if (!empty($errors)) {
+            return _t('设置未保存：') . implode('；', $errors);
+        }
+
+        // 校验通过，configHandle() 随后会落库。顺手做一次连接自检 ——
+        // 这是唯一适合做可写性测试的时机：用户主动触发、有人看着结果，
+        // 而不是让每个前台请求都白跑一遍。
+        if (($settings['enableCache'] ?? '0') === '1') {
+            $result = self::selfTest($settings);
+
+            return _t('设置已保存。Redis 自检：') . $result['message'];
+        }
+
+        return _t('设置已保存（缓存功能未启用）');
+    }
+
+    /**
+     * 接管配置保存
+     *
+     * 注意：一旦插件定义了 configHandle()，Typecho 就**不再代为保存**配置
+     * （var/Widget/Plugins/Edit.php:132-136 里 configHandle 返回 true 后就跳过了
+     * self::configPlugin），必须自己调 Helper::configPlugin()。
+     *
+     * @param array $settings 表单提交的配置
+     * @param bool  $isInit   是否为插件启用时写入的表单默认值
+     * @return void
+     */
+    public static function configHandle(array $settings, bool $isInit): void
+    {
+        // 启用插件时写入的是表单默认值，本来就合法，直接落库
+        if (!$isInit && !empty(self::validateConfig($settings))) {
+            // 校验不通过就不写库，原有配置保持不变。
+            // 提示信息由 configCheck() 负责，这里静默返回即可。
+            return;
+        }
+
+        Helper::configPlugin(basename(__DIR__), $settings);
+    }
+
+    /**
+     * 校验一份配置，返回全部错误信息
+     *
+     * 原则是「直接拒绝非法值，不静默修正」：
+     * - TTL 原先走 `intval($v) ?: 默认值`。负数为真会原样进 setex()，Redis 直接报
+     *   invalid expire time；填 0 则被悄悄改回默认值，界面上完全看不出来。
+     * - siteTag 原先在 makePrefix() 里被正则剥掉非法字符，于是 `site!` 和 `site?`
+     *   都变成 `site` —— 多站点共用一个 Redis 库时会共用同一命名空间，
+     *   表现为缓存串站或互相误清。makePrefix() 的剥离保留为兜底（老配置里可能
+     *   已经存着非法值），但新值一律在这里拒掉。
+     * - enableAuth 原先只控制后台字段显隐，完全没参与连接逻辑，是否认证实际由
+     *   密码是否为空决定。这里不去静默清空密码（那会直接搞坏一个正在工作的连接），
+     *   而是要求用户把开关和密码调成一致。
+     *
+     * @param array $settings
+     * @return string[]
+     */
+    private static function validateConfig(array $settings): array
+    {
+        $errors = [];
+
+        if (trim((string) ($settings['host'] ?? '')) === '') {
+            $errors[] = _t('Redis 服务地址不能为空');
+        }
+
+        $port = (string) ($settings['port'] ?? '');
+        if (!ctype_digit($port) || intval($port) < 1 || intval($port) > 65535) {
+            $errors[] = _t('Redis 服务端口必须是 1 到 65535 之间的整数');
+        }
+
+        $expires = [
+            'postExpire' => _t('文章缓存时间'),
+            'pageExpire' => _t('页面缓存时间'),
+        ];
+
+        foreach ($expires as $key => $label) {
+            $value = (string) ($settings[$key] ?? '');
+            if (!ctype_digit($value) || intval($value) < 1) {
+                $errors[] = _t('%s 必须是大于 0 的整数', $label);
+            }
+        }
+
+        $tag = trim((string) ($settings['siteTag'] ?? ''));
+        if ($tag !== '' && !preg_match('/^[A-Za-z0-9_-]+$/', $tag)) {
+            $errors[] = _t('站点标识只允许字母、数字、下划线与连字符');
+        }
+
+        $enableAuth = (string) ($settings['enableAuth'] ?? '0');
+        $password   = (string) ($settings['password'] ?? '');
+
+        if ($enableAuth === '1' && $password === '') {
+            $errors[] = _t('已启用 Redis 认证，但密码为空');
+        }
+
+        if ($enableAuth === '0' && $password !== '') {
+            $errors[] = _t('未启用 Redis 认证，但填写了密码；请启用认证，或清空密码');
+        }
+
+        return $errors;
+    }
+
+    /**
+     * 用给定的一组配置连一次 Redis，做一轮读写自检
+     *
+     * 只在后台保存配置时调用，不参与任何前台请求。直接吃 $settings 而不是读
+     * Helper::options()，因为此刻新配置还没落库。
+     *
+     * 键名带随机后缀并设了 TTL：原先固定用 {prefix}test，两个并发请求会互相
+     * 覆盖和误删，导致假阴性。
+     *
+     * @param array $settings
+     * @return array{ok: bool, message: string}
+     */
+    public static function selfTest(array $settings): array
+    {
+        try {
+            $prefix = self::makePrefix($settings['siteTag'] ?? '');
+            $key    = $prefix . 'test:' . bin2hex(random_bytes(8));
+            $value  = 'accelerate-selftest-' . bin2hex(random_bytes(8));
+
+            $redis     = new Redis();
+            $connected = $redis->connect(
+                (string) ($settings['host'] ?? '127.0.0.1'),
+                intval($settings['port'] ?? 6379),
+                self::CONNECT_TIMEOUT,
+                null,
+                0,
+                self::READ_TIMEOUT
+            );
+
+            if (!$connected) {
+                return ['ok' => false, 'message' => _t('无法连接到 Redis 服务')];
+            }
+
+            $redis->setOption(Redis::OPT_READ_TIMEOUT, self::READ_TIMEOUT);
+
+            $password = (string) ($settings['password'] ?? '');
+            if ($password !== '' && !$redis->auth($password)) {
+                return ['ok' => false, 'message' => _t('认证失败')];
+            }
+
+            $redis->setex($key, 10, $value);
+            $readBack = $redis->get($key);
+            $redis->del($key);
+            $redis->close();
+
+            if ($readBack !== $value) {
+                return [
+                    'ok'      => false,
+                    'message' => _t('连接正常，但写入校验未通过（实例可能是只读副本，或内存已满）'),
+                ];
+            }
+
+            return ['ok' => true, 'message' => _t('连接与读写均正常')];
+        } catch (Throwable $e) {
+            return ['ok' => false, 'message' => $e->getMessage()];
+        }
+    }
+
+    /**
      * 在后台导航栏插件状态显示
      *
      * @throws PluginException
@@ -415,7 +589,10 @@ class Plugin implements PluginInterface
 
             $redis->setOption(Redis::OPT_READ_TIMEOUT, self::READ_TIMEOUT);
 
-            // 如果设置了密码，进行验证
+            // 如果设置了密码，进行验证。
+            // 「是否认证」由密码是否为空决定，而不是由 enableAuth 决定 —— 这两者
+            // 的一致性改由 validateConfig() 在保存配置时强制（enableAuth=0 却填了
+            // 密码，或 enableAuth=1 却留空，都会被拒绝保存）。
             if (!empty($config->password)) {
                 $authResult = $redis->auth($config->password);
                 if (!$authResult) {
@@ -429,38 +606,23 @@ class Plugin implements PluginInterface
                 throw new \Exception('Redis 服务 PING 失败');
             }
 
-            $logMessage = date('[Y-m-d H:i:s]') . ' redis connect successful: ' . $config->host . ':' . $config->port;
-
-            // 写入测试数据
-            $testKey   = self::$prefix . 'test';
-            $testValue = 'Hello Typecho! ' . date('Y-m-d H:i:s');
-            $redis->set($testKey, $testValue);
-            $retrievedValue = $redis->get($testKey);
-
-            if ($retrievedValue !== $testValue) {
-                throw new \Exception('缓存测试数据写入失败');
+            // 这里原先还做了三件事，全部已经移出热路径：
+            //
+            // 1) 固定键名 {prefix}test 的写入 / 读回 / 删除（3 次额外往返）。
+            //    除了慢，还有并发竞争：请求 A 的 del() 可能早于请求 B 的 get()，
+            //    B 会读到 false，误判成「写入测试失败」并放弃整个连接，
+            //    该请求于是完全不走缓存。可写性测试现在只在后台保存配置时跑
+            //    （见 selfTest()），键名带随机后缀。
+            // 2) RedisJSON 探测（MODULE LIST + COMMAND INFO，最多 2 次往返）。
+            //    探测结果没有任何调用方，纯粹写进日志，已整体删除。
+            // 3) 无条件写一行连接成功日志 —— 相当于每个前台请求多做一次磁盘 append。
+            //    现在只在调试模式下写。
+            if (isset($config->debug) && $config->debug == '1') {
+                self::writeLog(
+                    $logFilename,
+                    date('[Y-m-d H:i:s]') . ' redis connect successful: ' . $config->host . ':' . $config->port
+                );
             }
-
-            // $retrievedValue 此处已通过 !== 比较确认为 string
-            $logMessage .= "\n" . date('[Y-m-d H:i:s]') . ' redis writable-test successful: ' . $retrievedValue;
-
-            // 删除测试数据
-            $redis->del($testKey);
-
-            // 探测 RedisJSON 支持情况并写入日志（不影响主流程）
-            try {
-                $json        = self::detectRedisJsonSupport($redis);
-                $logMessage .= "\n" . date('[Y-m-d H:i:s]') . ' redis json support: ' .
-                    ($json['supported'] ? 'YES' : 'NO') .
-                    ' via=' . ($json['via'] ?? '-') .
-                    (empty($json['module']) ? '' : ' module=' . $json['module']) .
-                    (empty($json['version']) ? '' : ' ver=' . $json['version']) .
-                    (empty($json['reason']) ? '' : ' reason=' . $json['reason']);
-            } catch (Throwable $e) {
-                $logMessage .= "\n" . date('[Y-m-d H:i:s]') . ' redis json support: UNKNOWN reason=' . $e->getMessage();
-            }
-
-            self::writeLog($logFilename, $logMessage);
 
             // 键结构迁移：清理不符合当前结构版本的历史缓存（失败不影响主流程）
             try {
@@ -512,102 +674,6 @@ class Plugin implements PluginInterface
 
             return $fallback;
         }
-    }
-
-    /**
-     * 探测当前 Redis 实例是否支持 RedisJSON（或老版本 ReJSON）
-     * 仅支持 Redis 8.0+
-     *
-     * 返回结构：
-     * - supported: bool    是否支持 JSON 命令
-     * - via:       string  探测方式（module_list / command_info / error）
-     * - module:    ?string 模块名（RedisJSON / ReJSON）
-     * - version:   ?string 模块版本
-     * - reason:    ?string 不支持或失败原因
-     *
-     * @param Redis $redis
-     * @return array{supported: bool, via: string, module: ?string, version: ?string, reason: ?string}
-     */
-    private static function detectRedisJsonSupport(Redis $redis): array
-    {
-        $result = [
-            'supported' => false,
-            'via'       => null,
-            'module'    => null,
-            'version'   => null,
-            'reason'    => null,
-        ];
-
-        // 1) 主推荐：MODULE LIST（Redis 4.0+ 标准方式）
-        try {
-            if (!method_exists($redis, 'rawCommand')) {
-                $result['via']    = 'module_list';
-                $result['reason'] = 'rawCommand_not_available';
-            } else {
-                $modules = $redis->rawCommand('MODULE', 'LIST');
-
-                if (!is_array($modules)) {
-                    $result['via']    = 'module_list';
-                    $result['reason'] = 'unexpected_reply';
-                } else {
-                    foreach ($modules as $moduleInfo) {
-                        if (!is_array($moduleInfo)) {
-                            continue;
-                        }
-
-                        $name    = (string) ($moduleInfo['name'] ?? '');
-                        $version = (string) ($moduleInfo['ver'] ?? '');
-
-                        // 检查是否为 JSON 模块
-                        if (!empty($name) && (strtolower($name) === 'rejson' || strtolower($name) === 'redisjson')) {
-                            return [
-                                'supported' => true,
-                                'via'       => 'module_list',
-                                'module'    => $name,
-                                'version'   => $version ?: null,
-                                'reason'    => null,
-                            ];
-                        }
-                    }
-
-                    $result['via']    = 'module_list';
-                    $result['reason'] = 'module_not_loaded';
-                }
-            }
-        } catch (Throwable $e) {
-            $result['via']    = 'module_list';
-            $result['reason'] = 'module_list_error: ' . $e->getMessage();
-        }
-
-        // 2) 备选：COMMAND INFO JSON.GET
-        try {
-            if (!method_exists($redis, 'rawCommand')) {
-                // 如果 rawCommand 不可用，直接返回失败
-                $result['reason'] ??= 'rawCommand_unavailable';
-                return $result;
-            }
-
-            $info = $redis->rawCommand('COMMAND', 'INFO', 'JSON.GET');
-            if (is_array($info) && count($info) > 0 && ($info[0] ?? null) !== null && $info !== [false]) {
-                return [
-                    'supported' => true,
-                    'via'       => 'command_info',
-                    'module'    => 'RedisJSON',
-                    'version'   => null,
-                    'reason'    => null,
-                ];
-            }
-
-            // COMMAND INFO 失败，保留之前的失败原因
-            $result['reason'] ??= 'command_not_found';
-        } catch (Throwable $e) {
-            $result['via']    ??= 'command_info';
-            $result['reason'] ??= 'command_info_error: ' . $e->getMessage();
-        }
-
-        $result['via']    ??= 'error';
-        $result['reason'] ??= 'unknown';
-        return $result;
     }
 
     /**
