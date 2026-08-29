@@ -569,7 +569,7 @@ class Plugin implements PluginInterface
      * 返回当前生效的缓存键前缀（公开 API，供 Panel.php 及第三方调用）
      *
      * initRedis() 成功后 self::$prefix 已就绪；若缓存被禁用导致 initRedis()
-     * 提前返回，则此处直接读配置补算一次，保证 Panel 列出的键与实际写入一致。
+     * 提前返回，则此处直接读配置重新算一次，保证 Panel 列出的键与实际写入一致。
      *
      * @return string
      */
