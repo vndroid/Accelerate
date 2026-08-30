@@ -4,6 +4,7 @@ namespace TypechoPlugin\Accelerate;
 
 use Redis;
 use Throwable;
+use Typecho\Cookie;
 use Typecho\Db\Exception as DbException;
 use Typecho\Plugin\Exception as PluginException;
 use Typecho\Plugin\PluginInterface;
@@ -46,8 +47,10 @@ class Plugin implements PluginInterface
      * v4: 键形态与 v3 相同。用于作废 v3 期间写入的两类脏缓存：404 页面
      *     （键名是合法的 list:0:{md5}）与密码保护文章的明文正文，
      *     两者都无法靠键名形态识别，只能整体作废。
+     * v5: hash 的输入从「路径」改为「规范 origin + 路径」，键形态不变。
+     *     同时作废 v4 期间可能被 http/https 或别名域名互相污染的缓存。
      */
-    private const SCHEMA_VERSION = '4';
+    private const SCHEMA_VERSION = '5';
 
     /**
      * 缓存键命名空间（硬编码，不可配置）
@@ -79,6 +82,31 @@ class Plugin implements PluginInterface
      * 不记忆失败的话，Redis 挂掉时每个调用点都要重新吃一遍 connect 超时。
      */
     private static bool $initFailed = false;
+
+    /**
+     * 当前命名空间的键结构是否已确认为 SCHEMA_VERSION
+     *
+     * 迁移由抢到锁的那一个请求执行，其余请求会跳过迁移。跳过之后如果照常读写，
+     * 就可能在迁移完成前命中上一版语义的键（例如 v3 遗留的 404 页面缓存、
+     * 密码文章明文）。因此把「schema 已就绪」作为前台读写的前置条件；
+     * 清理与后台管理路径不受它约束 —— 那些操作本来就是要去动旧数据的。
+     */
+    private static bool $schemaReady = false;
+
+    /**
+     * 进入 beforeRender() 时的 $_COOKIE 键集合
+     *
+     * 用于在 afterRender() 里判断渲染期间是否新设过 cookie。
+     * Typecho 的 Response::setCookie() 只把 cookie 存进数组、等 respond() 才发送，
+     * headers_list() 看不到；但 Cookie::set() 会同步写 $_COOKIE（见
+     * var/Typecho/Cookie.php:143），所以比对键集合就能发现。
+     */
+    private static array $cookieKeysAtStart = [];
+
+    /**
+     * 已注册延迟清理的 cid，避免批量操作时重复注册 shutdown 回调
+     */
+    private static array $deferredPurges = [];
 
     /**
      * 当前生效的完整缓存键前缀（命名空间 + 可选站点标识），由 makePrefix() 计算
@@ -140,6 +168,18 @@ class Plugin implements PluginInterface
         // 触发的是前者的 finishComment，前台访客评论触发的是后者，必须分别挂。
         // 另外评论只有 mark 没有 finishMark ——「通过 / 待审核 / 垃圾」三个操作都走 mark，
         // 且它在 UPDATE 之前触发（见 var/Widget/Comments/Edit.php::mark）。
+        // 引用与 Pingback。两者都只能挂 filter 而不是 finish* 钩子：
+        // Feedback::finishTrackback 与 XmlRpc::finishPingback 都只传 $widget，
+        // 而 trackback() 在触发钩子前没有像 comment() 那样 push 评论行
+        // （见 var/Widget/Feedback.php:265-271 与 :344-350），$widget->cid 拿不到。
+        // filter 的第一个参数里带着 cid，且必须原样返回。
+        // Pingback 用字符串句柄而不是 XmlRpc::pluginHandle()：后者会在启用插件时
+        // 就把 Widget\XmlRpc 及其 IXR 依赖全部 autoload 进来，而这个类平时只在
+        // XML-RPC 请求里用到。Plugin::factory() 按原始字符串建索引，
+        // 与类内 pluginHandle() 里的 static::class 完全一致。
+        Feedback::pluginHandle()->trackback = [self::class, 'clearCacheOnTrackback'];
+        \Typecho\Plugin::factory('Widget\\XmlRpc')->pingback = [self::class, 'clearCacheOnPingback'];
+
         CommentsEdit::pluginHandle()->mark          = [self::class, 'clearCacheOnCommentMark'];
         CommentsEdit::pluginHandle()->finishDelete  = [self::class, 'clearCacheOnCommentDelete'];
         CommentsEdit::pluginHandle()->finishEdit    = [self::class, 'clearCacheOnCommentTouch'];
@@ -370,13 +410,70 @@ class Plugin implements PluginInterface
     public static function configHandle(array $settings, bool $isInit): void
     {
         // 启用插件时写入的是表单默认值，本来就合法，直接落库
-        if (!$isInit && !empty(self::validateConfig($settings))) {
-            // 校验不通过就不写库，原有配置保持不变。
-            // 提示信息由 configCheck() 负责，这里静默返回即可。
-            return;
+        if (!$isInit) {
+            if (!empty(self::validateConfig($settings))) {
+                // 校验不通过就不写库，原有配置保持不变。
+                // 提示信息由 configCheck() 负责，这里静默返回即可。
+                return;
+            }
+
+            self::flushOnCriticalChange($settings);
         }
 
         Helper::configPlugin(basename(__DIR__), $settings);
+    }
+
+    /**
+     * 关键配置发生变化时，先按**旧配置**清空一次命名空间，再落库
+     *
+     * 针对两类会让存量缓存变得不可信的改动：
+     *
+     * 1) enableCache 从启用切到禁用（或反过来）。禁用期间 purgeCache() 虽然已经
+     *    改成忽略开关，但如果那段时间 Redis 本身不可达，失效就丢了；重新启用后
+     *    未过 TTL 的旧内容会原样复活。
+     * 2) uriPrefix / uriSuffix 收紧。已存在但不再符合规则的键不会自己消失。
+     * 3) siteTag / host / port / password 变化。前者换命名空间，后三者换实例 ——
+     *    都必须在切换**之前**、用旧参数连上去把旧数据清掉，否则就再也够不着了。
+     *
+     * @param array $settings 即将保存的新配置
+     * @return void
+     */
+    private static function flushOnCriticalChange(array $settings): void
+    {
+        try {
+            $old = Helper::options()->plugin(basename(__DIR__));
+        } catch (Throwable $e) {
+            // 还没有旧配置（首次保存），无需清理
+            return;
+        }
+
+        $watched = ['enableCache', 'uriPrefix', 'uriSuffix', 'siteTag', 'host', 'port', 'password'];
+        $changed = false;
+
+        foreach ($watched as $key) {
+            if ((string) ($old->$key ?? '') !== (string) ($settings[$key] ?? '')) {
+                $changed = true;
+                break;
+            }
+        }
+
+        if (!$changed) {
+            return;
+        }
+
+        // initRedis() 此刻读到的仍是旧配置，self::$prefix 也是旧前缀 —— 正是所需
+        $redis = self::initRedis(true);
+        if (!$redis) {
+            return;
+        }
+
+        $deleted = self::deleteByPattern($redis, self::$prefix . '*');
+
+        self::writeLog(
+            'cache-' . date('Y-m-d') . '.log',
+            date('[Y-m-d H:i:s]') . ' CACHE: (FLUSHED) REASON: '
+                . str_pad('(CONFIG CHANGED)', 50) . 'SUM: (TOTAL ' . $deleted . ' KEYs)'
+        );
     }
 
     /**
@@ -424,6 +521,24 @@ class Plugin implements PluginInterface
         $tag = trim((string) ($settings['siteTag'] ?? ''));
         if ($tag !== '' && !preg_match('/^[A-Za-z0-9_-]+$/', $tag)) {
             $errors[] = _t('站点标识只允许字母、数字、下划线与连字符');
+        }
+
+        // Radio 取值枚举校验。Typecho 的 Form\Element\Radio 没有内置取值约束，
+        // Form::validate() 也只跑显式 addRule() 加的规则，所以伪造的 POST 能存进库。
+        // 存进去之后各处判断会互相矛盾：initRedis() 用 !== '1' 之外的比较会当作启用，
+        // addAdminPageBar() 的 === '1' 又显示未启用。
+        $radios = [
+            'enableCache'            => _t('启用缓存'),
+            'enableAuth'             => _t('启用认证'),
+            'clearListOnComment'     => _t('评论时清理列表页缓存'),
+            'debug'                  => _t('调试模式'),
+            'cleanCacheOnDeactivate' => _t('禁用时清理缓存'),
+        ];
+
+        foreach ($radios as $key => $label) {
+            if (!in_array((string) ($settings[$key] ?? ''), ['0', '1'], true)) {
+                $errors[] = _t('%s 的取值不合法', $label);
+            }
         }
 
         $enableAuth = (string) ($settings['enableAuth'] ?? '0');
@@ -556,9 +671,12 @@ class Plugin implements PluginInterface
 
         $config = Helper::options()->plugin(basename(__DIR__));
 
-        // 如果禁用缓存，直接返回。这里不置 $initFailed —— 缓存被禁用不是连接失败，
+        // 如果未启用缓存，直接返回。这里不置 $initFailed —— 缓存被禁用不是连接失败，
         // 同一请求里随后带 $ignoreSwitch 的调用仍然应该能连上。
-        if (!$ignoreSwitch && isset($config->enableCache) && $config->enableCache == '0') {
+        //
+        // 判断用 !== '1'（白名单）而不是 == '0'：库里若存着历史脏值或伪造值，
+        // 「不等于 0 就算启用」会把无法识别的取值当成启用，白名单则安全默认。
+        if (!$ignoreSwitch && (string) ($config->enableCache ?? '0') !== '1') {
             return null;
         }
 
@@ -600,12 +718,8 @@ class Plugin implements PluginInterface
                 }
             }
 
-            // 检查连接
-            $pong = $redis->ping();
-            if ($pong !== '+PONG' && $pong !== true) {
-                throw new \Exception('Redis 服务 PING 失败');
-            }
-
+            // 这里原先有一次 PING。现在 migrateSchema() 的 GET 就是本请求的第一条
+            // 真实命令，连接不可用时它会抛异常并被下面的 catch 接住，PING 已成冗余。
             // 这里原先还做了三件事，全部已经移出热路径：
             //
             // 1) 固定键名 {prefix}test 的写入 / 读回 / 删除（3 次额外往返）。
@@ -624,15 +738,12 @@ class Plugin implements PluginInterface
                 );
             }
 
-            // 键结构迁移：清理不符合当前结构版本的历史缓存（失败不影响主流程）
-            try {
-                self::migrateSchema($redis, $logFilename);
-            } catch (Throwable $e) {
-                self::writeLog(
-                    $logFilename,
-                    date('[Y-m-d H:i:s]') . ' schema migration failed: ' . $e->getMessage()
-                );
-            }
+            // 键结构迁移。异常**不再吞掉** —— 迁移没走完就说明命名空间里还混着
+            // 上一版语义的键，此时继续用这个连接读缓存是不安全的，交给下面的
+            // catch 统一降级成「本请求不使用 Redis」。
+            // 返回 false 表示「别的请求正在迁移」，连接照常可用（清理与后台管理
+            // 仍需要它），只是前台读写要靠 $schemaReady 挡住。
+            self::$schemaReady = self::migrateSchema($redis, $logFilename);
 
             self::$redis = $redis;
             return $redis;
@@ -785,13 +896,22 @@ class Plugin implements PluginInterface
      * 而不必像旧版那样清空全站缓存；列表页不隶属于任何单篇内容，
      * id 段固定为 0，以保证 hash 恒定位于第 3 段。
      *
+     * hash 的输入是「规范 origin + 路径」而不是只有路径。同一条路径在
+     * http 与 https 下产出的页面并不相同：Widget\Options::___siteUrl() 会在
+     * $request->isSecure() 时把站点地址整体改写成 https（var/Widget/Options.php），
+     * 评论反垃圾令牌又是 md5(secret & 完整请求 URL)（var/Widget/Archive.php:1194，
+     * 其中 getUrlPrefix() 含 scheme 与 Host）。只用路径当键会让两种协议、
+     * 不同端口、别名域名共用同一份缓存，轻则令牌失配导致评论提交失败，
+     * 重则互相污染。origin 由 resolveCanonicalOrigin() 校验后给出。
+     *
+     * @param string  $origin     经白名单校验的 scheme://host[:port]
      * @param string  $requestUri
      * @param Archive $archive
      * @return string
      */
-    private static function makeCacheKey(string $requestUri, Archive $archive): string
+    private static function makeCacheKey(string $origin, string $requestUri, Archive $archive): string
     {
-        $hash = md5($requestUri);
+        $hash = md5($origin . $requestUri);
 
         if ($archive->is('single')) {
             $cid = intval($archive->cid);
@@ -852,21 +972,26 @@ class Plugin implements PluginInterface
      *
      * @param Redis  $redis
      * @param string $logFilename
-     * @return void
+     * @return bool 命名空间是否已确认为当前结构版本
      */
-    private static function migrateSchema(Redis $redis, string $logFilename): void
+    private static function migrateSchema(Redis $redis, string $logFilename): bool
     {
         $schemaKey = self::$prefix . 'schema';
 
         if ($redis->get($schemaKey) === self::SCHEMA_VERSION) {
-            return;
+            return true;
         }
 
-        // 抢占迁移锁，避免并发请求同时扫描整个 keyspace；
-        // 抢不到说明已有请求在迁移，本次直接跳过即可
+        // 抢占迁移锁，避免并发请求同时扫描整个 keyspace。
+        //
+        // TTL 取 300 秒而不是 60：keyspace 很大时一轮 SCAN 可能超过一分钟，
+        // 锁提前过期会让第二个请求开始第二轮迁移，与第一轮交叠。
         $lockKey = self::$prefix . 'schema:lock';
-        if (!$redis->set($lockKey, '1', ['nx', 'ex' => 60])) {
-            return;
+        if (!$redis->set($lockKey, '1', ['nx', 'ex' => 300])) {
+            // 已经有请求在迁移。**本次请求不能使用缓存** —— 此刻命名空间里
+            // 还混着上一版语义的键，读到就可能是不该对外的内容（例如 v3 遗留的
+            // 密码文章明文），写进去的新键也可能被随后的清理扫掉。
+            return false;
         }
 
         $purged = self::purgeLegacyKeys($redis);
@@ -879,6 +1004,8 @@ class Plugin implements PluginInterface
             date('[Y-m-d H:i:s]') . ' schema migrated to v' . self::SCHEMA_VERSION
                 . ': purged ' . $purged . ' legacy key(s)'
         );
+
+        return true;
     }
 
     /**
@@ -970,6 +1097,155 @@ class Plugin implements PluginInterface
     }
 
     /**
+     * 解析并校验当前请求的 origin
+     *
+     * **不能直接信任 Host 请求头**：它由客户端控制。如果按 Host 分别建键，
+     * 攻击者随便伪造几个 Host 就能生成任意多份缓存把内存撑满；如果不校验就
+     * 混用同一份缓存，又会出现别名域名污染主域名的问题。
+     * 这里的做法是二选一之外的第三条：Host 与站点配置的规范主机名不一致时
+     * **一律不缓存**，让这类请求老老实实回源。真要支持多域名，应当在 Web
+     * 服务器层做 301 规范化。
+     *
+     * 端口保留在 origin 里（同一主机的 :80 与 :8443 内容可能不同），
+     * 但比对主机名时忽略端口 —— 站点配置里的 siteUrl 未必写了端口。
+     *
+     * @return string|null scheme://host[:port]；无法确认规范性时返回 null
+     */
+    private static function resolveCanonicalOrigin(): ?string
+    {
+        $host = strtolower(trim((string) ($_SERVER['HTTP_HOST'] ?? '')));
+
+        if ($host === '') {
+            return null;
+        }
+
+        $options   = Helper::options();
+        $canonical = strtolower((string) parse_url($options->siteUrl, PHP_URL_HOST));
+
+        if ($canonical === '' || preg_replace('/:\d+$/', '', $host) !== $canonical) {
+            return null;
+        }
+
+        return ($options->request->isSecure() ? 'https' : 'http') . '://' . $host;
+    }
+
+    /**
+     * 判断路径是否满足配置里的 URI 前缀 / 后缀规则
+     *
+     * 抽成独立函数是为了让读、写两侧用同一份判断。原先这段只写在 afterRender()
+     * 里，于是缩小 uriPrefix / uriSuffix 之后，已经存在但不再符合规则的缓存
+     * 仍会一直命中到 TTL 到期；顺带地，beforeRender() 还会为这些注定写不进去的
+     * 请求白做一次 Redis GET 和一次 ob_start()。
+     *
+     * @param string $requestUri
+     * @param mixed  $config 插件配置
+     * @return bool
+     */
+    private static function matchesUriRules(string $requestUri, $config): bool
+    {
+        // URI 前缀筛选：读取配置中的路径前缀，只缓存匹配的页面
+        $rawPrefixes = isset($config->uriPrefix) ? trim($config->uriPrefix) : '/';
+        $uriPrefixes = array_filter(array_map('trim', explode(',', $rawPrefixes)));
+
+        $matched = false;
+        foreach ($uriPrefixes as $p) {
+            if ($p === '/' || str_starts_with($requestUri, $p)) {
+                $matched = true;
+                break;
+            }
+        }
+
+        if (!$matched) {
+            self::logPass('URI PREFIX NOT MATCHED', $requestUri, $config);
+            return false;
+        }
+
+        // URI 后缀筛选：根路径 / 始终通过；uriSuffix 为空则不限制
+        $rawSuffixes = isset($config->uriSuffix) ? trim($config->uriSuffix) : '';
+        if ($rawSuffixes !== '' && $requestUri !== '/') {
+            $uriSuffixes   = array_filter(array_map('trim', explode(',', $rawSuffixes)));
+            $suffixMatched = false;
+
+            foreach ($uriSuffixes as $suffix) {
+                if ($suffix !== '' && str_ends_with($requestUri, $suffix)) {
+                    $suffixMatched = true;
+                    break;
+                }
+            }
+
+            if (!$suffixMatched) {
+                self::logPass('URI SUFFIX NOT MATCHED', $requestUri, $config);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 调试模式下记录一次「跳过缓存」
+     *
+     * @param string $reason
+     * @param string $requestUri
+     * @param mixed  $config
+     * @return void
+     */
+    private static function logPass(string $reason, string $requestUri, $config): void
+    {
+        if (!isset($config->debug) || $config->debug != '1') {
+            return;
+        }
+
+        self::writeLog(
+            'cache-' . date('Y-m-d') . '.log',
+            date('[Y-m-d H:i:s]') . ' CACHE: (PASS)    REASON: '
+                . str_pad('(' . $reason . ')', 50) . 'URI: (' . $requestUri . ')'
+        );
+    }
+
+    /**
+     * 渲染结束后，判断这个响应本身是否适合被缓存
+     *
+     * isCacheableArchive() 拦的是 Typecho 自己产出的 404 / 403，但主题或其他插件
+     * 在渲染期间仍可能把响应变成别的东西。命中缓存时插件是以 200 text/html 输出的，
+     * 所以任何非 200、带跳转、或与访客绑定的响应都不能进缓存。
+     *
+     * 说明一下这里**没有**检查什么、以及为什么：
+     * - 301/302：Typecho 自己的 redirect() 走 Response::respond()，那个方法末尾
+     *   就是 exit（var/Typecho/Response.php:235），afterRender 根本不会执行。
+     *   这里的 Location 检查只针对主题裸调 header() 且不 exit 的情况。
+     * - Typecho 自己 setStatus() 的状态码：Response::$status 是 private 且没有
+     *   getStatus()，读不到。已知会设状态码的两条路径（404、密码文章 403）
+     *   都在 isCacheableArchive() 里按归档类型拦掉了。
+     *
+     * @return bool
+     */
+    private static function isCacheableResponse(): bool
+    {
+        // 1) PHP 层状态码。抓得到主题 / 插件裸调的 http_response_code() 与 header()。
+        if (http_response_code() !== 200) {
+            return false;
+        }
+
+        // 2) 渲染期间直接发出的跳转或个性化响应头
+        foreach (headers_list() as $header) {
+            if (stripos($header, 'Location:') === 0 || stripos($header, 'Set-Cookie:') === 0) {
+                return false;
+            }
+        }
+
+        // 3) Typecho 层设置的 cookie。Response::setCookie() 只把 cookie 存进数组、
+        //    等 respond() 才发送，headers_list() 看不到；但 Cookie::set() 会同步写
+        //    $_COOKIE（var/Typecho/Cookie.php:143），所以比对键集合就能发现。
+        //    渲染期间新设或删除 cookie，都意味着这个响应是绑定到当前访客的。
+        if (array_keys($_COOKIE) !== self::$cookieKeysAtStart) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
      * 判断当前请求本身是否可以参与缓存
      *
      * 这里只依据 HTTP 请求与 Typecho 核心的行为做判断，不涉及任何具体主题，
@@ -1013,7 +1289,22 @@ class Plugin implements PluginInterface
         //    cookie 的访客渲染出受保护文章的正文摘要。
         //    本函数在 beforeRender() 里于「查缓存」之前调用，因此读、写两侧
         //    同时被阻断：持有密码的访客既不会污染缓存，也不会命中别人的缓存。
-        foreach (array_keys($_COOKIE) as $name) {
+        //
+        //    **必须先去掉 Typecho 的 cookie 前缀再比对**：Cookie::setPrefix() 会把
+        //    md5($options->rootUrl) 拼在每个键名前面（var/Typecho/Cookie.php:69/128/142，
+        //    由 var/Widget/Init.php:96 调用），上面这些 cookie 全部走 Cookie::set() 写入，
+        //    所以 $_COOKIE 里的真实键名形如
+        //    「32位十六进制 + __typecho_remember_mail」。直接对裸名做前缀匹配
+        //    一条都匹配不上，等于整段判断失效。
+        //    Init 早于 beforeRender 执行，此处 getPrefix() 必已就绪；前缀为空
+        //    （或有人手工种了裸 cookie）时下面的写法同样成立。
+        $cookiePrefix = Cookie::getPrefix();
+
+        foreach (array_keys($_COOKIE) as $rawName) {
+            $name = ($cookiePrefix !== '' && str_starts_with($rawName, $cookiePrefix))
+                ? substr($rawName, strlen($cookiePrefix))
+                : $rawName;
+
             if (
                 str_starts_with($name, '__typecho_remember_')
                 || $name === '__typecho_unapproved_comment'
@@ -1099,12 +1390,29 @@ class Plugin implements PluginInterface
             return;
         }
 
+        $config = Helper::options()->plugin(basename(__DIR__));
+
+        // Host 与站点规范主机名不一致时不参与缓存。若站点确实要支持多个域名，
+        // 请在 Web 服务器层做 301 规范化 —— 这里放行只会让缓存互相污染。
+        $origin = self::resolveCanonicalOrigin();
+        if ($origin === null) {
+            self::logPass('NON CANONICAL ORIGIN', $requestUri, $config);
+            return;
+        }
+
         if (!self::isCacheableArchive($archive)) {
             return;
         }
 
         $user = User::alloc();
         if ($user->hasLogin()) {
+            return;
+        }
+
+        // URI 规则在「查缓存之前」判断。放在写入侧才判断的话，用户缩小
+        // uriPrefix / uriSuffix 之后，已存在但不再符合规则的缓存会一直命中到
+        // TTL 到期；而且这些注定写不进去的请求还会白做一次 GET 和一次 ob_start()。
+        if (!self::matchesUriRules($requestUri, $config)) {
             return;
         }
 
@@ -1124,7 +1432,13 @@ class Plugin implements PluginInterface
             return;
         }
 
-        $cacheKey      = self::makeCacheKey($requestUri, $archive);
+        // 迁移未确认完成时不读缓存：命名空间里可能还混着上一版语义的键
+        if (!self::$schemaReady) {
+            self::logPass('SCHEMA NOT READY', $requestUri, $config);
+            return;
+        }
+
+        $cacheKey      = self::makeCacheKey($origin, $requestUri, $archive);
         $cachedContent = self::attempt(
             fn () => $redis->get($cacheKey),
             false,
@@ -1134,8 +1448,6 @@ class Plugin implements PluginInterface
         // 用 is_string 而不是 !== false：读取失败时 attempt() 也返回 false，
         // 两种情况都应当按「未命中」处理。
         if (is_string($cachedContent)) {
-            $config = Helper::options()->plugin(basename(__DIR__));
-
             if (isset($config->debug) && $config->debug == '1') {
                 self::writeLog(
                     'cache-' . date('Y-m-d') . '.log',
@@ -1169,7 +1481,11 @@ class Plugin implements PluginInterface
             exit();
         }
 
-        // 缓存未命中，开始输出缓冲
+        // 缓存未命中，开始输出缓冲。
+        // 同时记下当前的 cookie 键集合，afterRender() 用它判断渲染期间是否
+        // 新设过 cookie（那意味着响应绑定到了当前访客，不能进公共缓存）。
+        self::$cookieKeysAtStart = array_keys($_COOKIE);
+
         ob_start();
         self::$obStarted = true;
     }
@@ -1197,13 +1513,19 @@ class Plugin implements PluginInterface
         }
 
         $redis = self::initRedis();
-        if (!$redis) {
+        if (!$redis || !self::$schemaReady) {
             ob_end_flush();
             return;
         }
 
         $requestUri = self::resolveRequestPath();
         if ($requestUri === null) {
+            ob_end_flush();
+            return;
+        }
+
+        $origin = self::resolveCanonicalOrigin();
+        if ($origin === null) {
             ob_end_flush();
             return;
         }
@@ -1217,50 +1539,18 @@ class Plugin implements PluginInterface
 
         $config = Helper::options()->plugin(basename(__DIR__));
 
-        // URI 前缀筛选：读取配置中的路径前缀，只缓存匹配的页面
-        $rawPrefixes = isset($config->uriPrefix) ? trim($config->uriPrefix) : '/';
-        $uriPrefixes = array_filter(array_map('trim', explode(',', $rawPrefixes)));
-
-        $matched = false;
-        foreach ($uriPrefixes as $p) {
-            if ($p === '/' || str_starts_with($requestUri, $p)) {
-                $matched = true;
-                break;
-            }
-        }
-
-        if (!$matched) {
-            if (isset($config->debug) && $config->debug == '1') {
-                self::writeLog(
-                    'cache-' . date('Y-m-d') . '.log',
-                    date('[Y-m-d H:i:s]') . ' CACHE: (PASS)    REASON: (URI PREFIX NOT MATCHED)                           URI: (' . $requestUri . ')'
-                );
-            }
+        // 与 beforeRender() 共用同一份 URI 规则判断
+        if (!self::matchesUriRules($requestUri, $config)) {
             ob_end_flush();
             return;
         }
 
-        // URI 后缀筛选：根路径 / 始终通过；uriSuffix 为空则不限制
-        $rawSuffixes = isset($config->uriSuffix) ? trim($config->uriSuffix) : '';
-        if ($rawSuffixes !== '' && $requestUri !== '/') {
-            $uriSuffixes   = array_filter(array_map('trim', explode(',', $rawSuffixes)));
-            $suffixMatched = false;
-            foreach ($uriSuffixes as $s) {
-                if ($s !== '' && str_ends_with($requestUri, $s)) {
-                    $suffixMatched = true;
-                    break;
-                }
-            }
-            if (!$suffixMatched) {
-                if (isset($config->debug) && $config->debug == '1') {
-                    self::writeLog(
-                        'cache-' . date('Y-m-d') . '.log',
-                        date('[Y-m-d H:i:s]') . ' CACHE: (PASS)    REASON: (URI SUFFIX NOT MATCHED)                           URI: (' . $requestUri . ')'
-                    );
-                }
-                ob_end_flush();
-                return;
-            }
+        // 响应级校验：渲染过程中主题或其他插件可能把响应变成非 200、跳转，
+        // 或设置了与访客绑定的 cookie。这些都不能以 200 text/html 缓存下来。
+        if (!self::isCacheableResponse()) {
+            self::logPass('RESPONSE NOT CACHEABLE', $requestUri, $config);
+            ob_end_flush();
+            return;
         }
 
         // 原先这里用 substr_count($requestUri, '/') > 2 跳过「较深嵌套」的路径。
@@ -1278,7 +1568,7 @@ class Plugin implements PluginInterface
             return;
         }
 
-        $cacheKey = self::makeCacheKey($requestUri, $archive);
+        $cacheKey = self::makeCacheKey($origin, $requestUri, $archive);
         $ttl      = self::getExpireForArchive($archive);
 
         // 若站点开启了「评论自动关闭」，缓存不应活过该内容仍可评论的时间窗，
@@ -1398,7 +1688,40 @@ class Plugin implements PluginInterface
      */
     public static function clearCacheOnCommentMark(array $comment, CommentsEdit $widget, string $status): void
     {
-        self::purgeCommentCache(intval($comment['cid'] ?? 0), 'COMMENT MARKED ' . strtoupper($status));
+        self::purgeCommentCacheDeferred(
+            intval($comment['cid'] ?? 0),
+            'COMMENT MARKED ' . strtoupper($status)
+        );
+    }
+
+    /**
+     * 前台引用（Trackback）时清除缓存（trackback 是 filter，必须原样返回）
+     *
+     * @param array $trackback 待插入的引用行，含 cid
+     * @param mixed $content   被引用的内容
+     * @return array
+     * @throws PluginException
+     */
+    public static function clearCacheOnTrackback(array $trackback, $content): array
+    {
+        self::purgeCommentCacheDeferred(intval($trackback['cid'] ?? 0), 'NEW TRACKBACK');
+
+        return $trackback;
+    }
+
+    /**
+     * XML-RPC Pingback 时清除缓存（pingback 是 filter，必须原样返回）
+     *
+     * @param array $pingback 待插入的 pingback 行，含 cid
+     * @param mixed $post     被 ping 的内容
+     * @return array
+     * @throws PluginException
+     */
+    public static function clearCacheOnPingback(array $pingback, $post): array
+    {
+        self::purgeCommentCacheDeferred(intval($pingback['cid'] ?? 0), 'NEW PINGBACK');
+
+        return $pingback;
     }
 
     /**
@@ -1454,6 +1777,45 @@ class Plugin implements PluginInterface
     }
 
     /**
+     * 「立即清理 + 请求收尾时再清一次」
+     *
+     * 用于那些在数据库写入**之前**触发的钩子：
+     * - Widget\Comments\Edit::mark（通过 / 待审核 / 垃圾，见该文件 mark() 方法）
+     * - Widget\Feedback 的 trackback filter
+     * - Widget\XmlRpc 的 pingback filter
+     *
+     * 只清一次的话，「清完缓存」和「状态落库」之间存在一个窗口：期间若有前台
+     * 请求进来，它读到的还是旧状态，于是把旧内容重新写回缓存。核心没有提供
+     * 更靠后的钩子，但 register_shutdown_function 可以：请求收尾时数据库写入
+     * 早已完成，此时再清一次即可关闭窗口（throwJson() 的 exit 不影响 shutdown 回调）。
+     *
+     * 批量操作会对每条评论各触发一次钩子，因此按 cid 去重，只注册一个回调。
+     *
+     * @param int    $cid
+     * @param string $reason
+     * @return void
+     * @throws PluginException
+     */
+    private static function purgeCommentCacheDeferred(int $cid, string $reason): void
+    {
+        self::purgeCommentCache($cid, $reason);
+
+        if (isset(self::$deferredPurges[$cid])) {
+            return;
+        }
+
+        self::$deferredPurges[$cid] = true;
+
+        register_shutdown_function(static function () use ($cid, $reason) {
+            try {
+                self::purgeCommentCache($cid, $reason . ' (DEFERRED)');
+            } catch (Throwable $e) {
+                // 请求已经结束，这里再抛异常没有任何意义
+            }
+        });
+    }
+
+    /**
      * 清空全部内容缓存（公开 API）
      *
      * 供主题或其他插件在自身配置变更后主动调用，例如主题轮换了第三方服务的
@@ -1466,12 +1828,12 @@ class Plugin implements PluginInterface
      * 用 class_exists 保护即可，调用方不会因为未安装本插件而报错。
      *
      * @param string $reason 写入日志的原因说明
-     * @return void
+     * @return int 实际删除的键数量
      * @throws PluginException
      */
-    public static function flushAll(string $reason = 'MANUAL FLUSH'): void
+    public static function flushAll(string $reason = 'MANUAL FLUSH'): int
     {
-        self::purgeCache(0, true, $reason);
+        return self::purgeCache(0, true, $reason);
     }
 
     /**
@@ -1481,14 +1843,17 @@ class Plugin implements PluginInterface
      *                           小于等于 0 时作为兜底清理全部单篇缓存
      * @param bool   $clearLists 是否一并清理列表页缓存
      * @param string $reason     写入日志的原因说明
-     * @return void
+     * @return int 实际删除的键数量
      * @throws PluginException
      */
-    private static function purgeCache(int $cid, bool $clearLists, string $reason): void
+    private static function purgeCache(int $cid, bool $clearLists, string $reason): int
     {
-        $redis = self::initRedis();
+        // 传 true 忽略 enableCache 开关。用户关掉缓存之后，删除 / 隐藏 / 评论等
+        // 失效操作原先完全拿不到连接，等他重新打开缓存，未过 TTL 的旧页面就会
+        // 原样复活。清理动作和「是否启用缓存」本来就是两回事。
+        $redis = self::initRedis(true);
         if (!$redis) {
-            return;
+            return 0;
         }
 
         $scope   = $cid > 0 ? $cid . ':*' : '*';
@@ -1500,7 +1865,7 @@ class Plugin implements PluginInterface
         }
 
         if ($deleted <= 0) {
-            return;
+            return 0;
         }
 
         $config = Helper::options()->plugin(basename(__DIR__));
@@ -1513,5 +1878,7 @@ class Plugin implements PluginInterface
                     . 'SUM: (TOTAL ' . $deleted . ' KEYs)'
             );
         }
+
+        return $deleted;
     }
 }

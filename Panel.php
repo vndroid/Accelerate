@@ -44,21 +44,45 @@ if (isset($_POST['do']) && $_POST['do'] === 'delete' && !empty($_POST['keys'])) 
             }
         }
 
-        $count = $validKeys ? intval($redis->del($validKeys)) : 0;
         $rejected = count($keysToDelete) - count($validKeys);
 
-        \Widget\Notice::alloc()->set(
-            $rejected > 0
-                ? _t('成功删除 %d 条缓存，%d 条键名不合法已忽略', $count, $rejected)
-                : _t('成功删除 %d 条缓存', $count),
-            $rejected > 0 ? 'notice' : 'success'
-        );
+        // Redis 可能在页面加载之后才断开、变成只读或报错。管理页的一次删除操作
+        // 不该让整个后台请求以异常页收场。
+        try {
+            $count = $validKeys ? intval($redis->del($validKeys)) : 0;
+
+            \Widget\Notice::alloc()->set(
+                $rejected > 0
+                    ? _t('成功删除 %d 条缓存，%d 条键名不合法已忽略', $count, $rejected)
+                    : _t('成功删除 %d 条缓存', $count),
+                $rejected > 0 ? 'notice' : 'success'
+            );
+        } catch (\Throwable $e) {
+            \Widget\Notice::alloc()->set(_t('删除缓存失败：%s', $e->getMessage()), 'error');
+        }
     }
     // 原先这里写的是 \Typecho\Response::alloc() —— 该类根本没有 alloc()，
     // 只有 getInstance()，而且它是底层 HTTP 响应对象、也没有 redirect()。
     // 换句话说，删除操作以前每次都会以 Fatal error 收场。
     // 带 redirect() 的是 Typecho\Widget\Response，即 $options->response。
     Helper::options()->response->redirect($currentUrl);
+}
+
+// 清空全部内容缓存。
+// 有了它，「扫描上限之外的键管不到」就不再是问题 —— 不必为了能删干净而去做
+// 真正的 Redis 游标分页（游标分页不能跳页、不能回退，页与页之间还可能重复或遗漏，
+// 对一个「看一眼再删几条」的管理页是负收益）。
+if (isset($_POST['do']) && $_POST['do'] === 'flush') {
+    $security->protect();
+
+    try {
+        $flushed = Plugin::flushAll('MANUAL FLUSH FROM PANEL');
+        \Widget\Notice::alloc()->set(_t('已清空全部内容缓存，共 %d 条', $flushed), 'success');
+    } catch (\Throwable $e) {
+        \Widget\Notice::alloc()->set(_t('清空缓存失败：%s', $e->getMessage()), 'error');
+    }
+
+    Helper::options()->response->redirect($panelUrl);
 }
 
 include 'header.php';
@@ -90,8 +114,12 @@ if ($redis) {
                 // 只列出内容缓存键。控制键（test / schema / schema:lock）与命名空间
                 // 之外的键都会被判否 —— 这里和删除校验用的是同一个函数，
                 // 因此不会出现「列表里能看到、点删除却被拒绝」的错位。
+                //
+                // 用键名当数组下标是为了去重：SCAN 只保证「全程存在的元素至少
+                // 返回一次」，同一个键在游标推进过程中**可能被返回多次**，
+                // 直接 append 会让列表出现重复行、总数也偏大。
                 if (Plugin::isContentCacheKey($key)) {
-                    $allKeys[] = $key;
+                    $allKeys[$key] = true;
                 }
             }
 
@@ -105,6 +133,7 @@ if ($redis) {
     }
 }
 
+$allKeys = array_keys($allKeys);
 sort($allKeys);
 
 $total      = count($allKeys);
@@ -235,6 +264,12 @@ foreach ($pageKeys as $i => $key) {
                             </table>
                         </div>
                         <input type="hidden" name="do" value="delete" id="do-action" />
+                    </form>
+
+                    <form method="post" action="<?php echo $security->getTokenUrl($panelUrl); ?>" class="typecho-list-operate clearfix">
+                        <input type="hidden" name="do" value="flush" />
+                        <button class="btn btn-s btn-warn" type="submit"
+                                onclick="return confirm('<?php _e('确认要清空全部内容缓存吗?'); ?>');"><?php _e('清空全部内容缓存'); ?></button>
                     </form>
 
                     <?php if ($totalPages > 1): ?>
