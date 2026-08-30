@@ -130,8 +130,9 @@ if ($redis) {
                 }
             }
 
-            if (count($allKeys) >= $scanLimit) {
-                $truncated = true;
+            // 多收一条当哨兵：只有真的存在第 5001 条时才算截断。
+            // 写成 >= $scanLimit 的话，总数恰好 5000（一条不多）也会被判成截断。
+            if (count($allKeys) > $scanLimit) {
                 break;
             }
         }
@@ -143,8 +144,9 @@ if ($redis) {
 $allKeys = array_keys($allKeys);
 sort($allKeys);
 
-// 上面的上限判断是在整批 foreach 之后做的，COUNT 500 意味着最多可能溢出到
-// 5499 条。这里裁到准确的上限，免得页面上写着「前 5000 条」却列出更多。
+// 上限判断在整批 foreach 之后做，COUNT 500 意味着实际可能多收几百条。
+// 「收到的比上限多」才是截断的准确判据，同时把列表裁到准确的上限，
+// 免得页面上写着「前 5000 条」却列出更多。
 if (count($allKeys) > $scanLimit) {
     $allKeys   = array_slice($allKeys, 0, $scanLimit);
     $truncated = true;
@@ -164,8 +166,9 @@ $pageKeys   = array_slice($allKeys, ($page - 1) * $pageSize, $pageSize);
  * PHP 只为了算个长度。现在改用服务端 STRLEN，返回的是缓存内容本身的字节数
  * （比 MEMORY USAGE 略小，后者含 Redis 自身的对象开销）。
  */
-$sizes = [];
-$ttls  = [];
+$sizes       = [];
+$ttls        = [];
+$statsFailed = false;
 
 if ($redis && $pageKeys) {
     try {
@@ -178,14 +181,17 @@ if ($redis && $pageKeys) {
         }
         $replies = $pipe->exec();
 
-        if (is_array($replies)) {
+        if (is_array($replies) && count($replies) === count($pageKeys) * 2) {
             $count = count($pageKeys);
             $sizes = array_slice($replies, 0, $count);
             $ttls  = array_slice($replies, $count, $count);
+        } else {
+            $statsFailed = true;
         }
     } catch (\Throwable $e) {
-        $sizes = [];
-        $ttls  = [];
+        $sizes       = [];
+        $ttls        = [];
+        $statsFailed = true;
     }
 }
 
@@ -199,8 +205,10 @@ foreach ($pageKeys as $i => $key) {
         'type'   => $parts[0],
         'cid'    => $parts[1] === '0' ? '' : $parts[1],
         'md5Key' => $parts[2],
-        'size'   => intval($sizes[$i] ?? 0),
-        'ttl'    => intval($ttls[$i] ?? -1),
+        // pipeline 失败时给 null 而不是缺省值。给 0 / -1 的话，页面会理直气壮地
+        // 显示「0.00 KB」和「永久」—— 那是两个看起来很确定、其实完全没有依据的结论。
+        'size'   => array_key_exists($i, $sizes) ? intval($sizes[$i]) : null,
+        'ttl'    => array_key_exists($i, $ttls) ? intval($ttls[$i]) : null,
     ];
 }
 ?>
@@ -217,6 +225,9 @@ foreach ($pageKeys as $i => $key) {
                 <?php else: ?>
                     <?php if ($truncated): ?>
                         <div class="message notice"><?php _e('缓存键过多，这里只列出扫描到的前 %d 条。', $scanLimit); ?></div>
+                    <?php endif; ?>
+                    <?php if ($statsFailed): ?>
+                        <div class="message error"><?php _e('读取缓存大小与过期时间失败，本页的这两列显示为「—」和「未知」。'); ?></div>
                     <?php endif; ?>
                     <form method="post" name="manage_caches" class="operate-form">
                         <div class="typecho-list-operate clearfix">
@@ -265,13 +276,15 @@ foreach ($pageKeys as $i => $key) {
                                                 <td>
                                                     <?php if ($item['cid'] !== ''): ?><strong>#<?php echo htmlspecialchars($item['cid']); ?></strong> &middot; <?php endif; ?><?php echo htmlspecialchars($item['md5Key']); ?>
                                                 </td>
-                                                <td><?php echo number_format($item['size'] / 1024, 2); ?> KB</td>
+                                                <td><?php echo $item['size'] === null ? '—' : number_format($item['size'] / 1024, 2) . ' KB'; ?></td>
                                                 <td><?php
                                                     // phpredis 的 ttl()：-1 = 键存在但没有过期时间，-2 = 键已不存在。
                                                     // 原先两者都落进「永久」分支。内容键一律用 setex 写入，TTL 恒 >= 1，
                                                     // 所以 -2 通常是这个键在 SCAN 与 pipeline 之间刚好过期了，
                                                     // 而 -1 反倒说明有人手工往这个命名空间里塞过键。
-                                                    if ($item['ttl'] > 0) {
+                                                    if ($item['ttl'] === null) {
+                                                        _e('未知');
+                                                    } elseif ($item['ttl'] > 0) {
                                                         echo intval($item['ttl']) . ' 秒';
                                                     } elseif ($item['ttl'] === -1) {
                                                         _e('永久');

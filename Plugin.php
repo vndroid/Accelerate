@@ -95,6 +95,19 @@ class Plugin implements PluginInterface
     private static bool $schemaReady = false;
 
     /**
+     * 本次请求使用的 schema 哨兵值：SCHEMA_VERSION + 配置代次
+     *
+     * 光有 SCHEMA_VERSION 挡不住这个场景：改 siteTag / host / port 时，
+     * flushOnCriticalChange() 会用旧配置去清空旧命名空间，但**那一刻 Redis
+     * 恰好不可达**的话清理就失败了，而配置照样保存。旧命名空间里 schema 仍是
+     * 当前版本、内容键也都在，日后一旦切回去就会原样命中陈旧内容。
+     *
+     * 加一段代次即可：代次存在插件配置（数据库）里，不依赖 Redis 当时是否活着。
+     * 每次关键配置变更都递增，于是切回旧命名空间时哨兵必然对不上，强制全量作废。
+     */
+    private static string $schemaStamp = '';
+
+    /**
      * 进入 beforeRender() 时的 $_COOKIE 快照
      *
      * 用于在 afterRender() 里判断渲染期间是否动过 cookie。
@@ -438,7 +451,7 @@ class Plugin implements PluginInterface
                 return;
             }
 
-            self::flushOnCriticalChange($settings);
+            $settings = self::flushOnCriticalChange($settings);
         }
 
         Helper::configPlugin(basename(__DIR__), $settings);
@@ -456,16 +469,21 @@ class Plugin implements PluginInterface
      * 3) siteTag / host / port / password 变化。前者换命名空间，后三者换实例 ——
      *    都必须在切换**之前**、用旧参数连上去把旧数据清掉，否则就再也够不着了。
      *
+     * 无论清理成功与否都会递增配置代次 cacheGeneration，并把它写进返回的
+     * $settings 一起落库。这一步才是真正的保险：清理依赖 Redis 当场可达，
+     * 代次不依赖 —— 就算这次一个键都没删掉，旧命名空间里的哨兵也已经过期了，
+     * 日后切回去必然触发一次全量作废。
+     *
      * @param array $settings 即将保存的新配置
-     * @return void
+     * @return array 可能带上了新代次的配置
      */
-    private static function flushOnCriticalChange(array $settings): void
+    private static function flushOnCriticalChange(array $settings): array
     {
         try {
             $old = Helper::options()->plugin(basename(__DIR__));
         } catch (Throwable $e) {
             // 还没有旧配置（首次保存），无需清理
-            return;
+            return $settings;
         }
 
         $watched = ['enableCache', 'uriPrefix', 'uriSuffix', 'siteTag', 'host', 'port', 'password'];
@@ -479,13 +497,18 @@ class Plugin implements PluginInterface
         }
 
         if (!$changed) {
-            return;
+            return $settings;
         }
+
+        // 递增代次。cacheGeneration 不在 config(Form) 里声明，所以 getAllRequest()
+        // 不会带它；而 Helper::configPlugin() 内部是 array_merge($已存, $settings)，
+        // 因此不主动写的时候旧值会自然保留。
+        $settings['cacheGeneration'] = intval($old->cacheGeneration ?? 0) + 1;
 
         // initRedis() 此刻读到的仍是旧配置，self::$prefix 也是旧前缀 —— 正是所需
         $redis = self::initRedis(true);
         if (!$redis) {
-            return;
+            return $settings;
         }
 
         $deleted = self::deleteByPattern($redis, self::$prefix . '*');
@@ -493,9 +516,11 @@ class Plugin implements PluginInterface
         self::writeLog(
             'cache-' . date('Y-m-d') . '.log',
             date('[Y-m-d H:i:s]') . ' CACHE: (FLUSHED) REASON: '
-                . str_pad('(CONFIG CHANGED)', 50)
+                . str_pad('(CONFIG CHANGED GEN ' . $settings['cacheGeneration'] . ')', 50)
                 . ($deleted === null ? 'SUM: (FAILED)' : 'SUM: (TOTAL ' . $deleted . ' KEYs)')
         );
+
+        return $settings;
     }
 
     /**
@@ -703,9 +728,10 @@ class Plugin implements PluginInterface
         }
 
         // 设置缓存参数，配置为空时使用默认值
-        self::$prefix     = self::makePrefix($config->siteTag ?? '');
-        self::$postExpire = intval($config->postExpire) ?: 86400;
-        self::$pageExpire = intval($config->pageExpire) ?: 2592000;
+        self::$prefix      = self::makePrefix($config->siteTag ?? '');
+        self::$schemaStamp = self::SCHEMA_VERSION . ':' . intval($config->cacheGeneration ?? 0);
+        self::$postExpire  = intval($config->postExpire) ?: 86400;
+        self::$pageExpire  = intval($config->pageExpire) ?: 2592000;
 
         // 创建日志目录（writeLog 会自行处理，此处无需手动创建）
         $logFilename = 'redis-' . date('Y-m-d') . '.log';
@@ -1006,7 +1032,8 @@ class Plugin implements PluginInterface
     {
         $schemaKey = self::$prefix . 'schema';
 
-        if ($redis->get($schemaKey) === self::SCHEMA_VERSION) {
+        // 比对的是「版本 + 配置代次」，不是光比版本，原因见 $schemaStamp 的注释
+        if ($redis->get($schemaKey) === self::$schemaStamp) {
             return true;
         }
 
@@ -1024,12 +1051,12 @@ class Plugin implements PluginInterface
 
         $purged = self::purgeLegacyKeys($redis);
 
-        $redis->set($schemaKey, self::SCHEMA_VERSION);
+        $redis->set($schemaKey, self::$schemaStamp);
         $redis->del($lockKey);
 
         self::writeLog(
             $logFilename,
-            date('[Y-m-d H:i:s]') . ' schema migrated to v' . self::SCHEMA_VERSION
+            date('[Y-m-d H:i:s]') . ' schema migrated to ' . self::$schemaStamp
                 . ': purged ' . $purged . ' legacy key(s)'
         );
 
@@ -1043,7 +1070,8 @@ class Plugin implements PluginInterface
      * 比「按形态识别历史格式」既更简单也更安全：它同时覆盖两种情况 ——
      * 键结构变更（旧键无法命中也无法按 cid 清理），以及键名合法但内容
      * 已不可信（例如 v3 期间写入的 404 页面缓存、密码保护文章明文）。
-     * 将来无论出于哪种原因需要作废缓存，只需递增 SCHEMA_VERSION。
+     * 将来无论出于哪种原因需要作废缓存，只需递增 SCHEMA_VERSION；
+     * 关键配置变更导致的作废则由 $schemaStamp 里的配置代次自动完成。
      *
      * @param Redis $redis
      * @return int 实际删除的键数量
@@ -1245,15 +1273,21 @@ class Plugin implements PluginInterface
      *
      * **这是对 Typecho 私有字段的脆弱耦合**，字段一旦改名就读不到了，因此整段
      * 包在 try/catch 里：读不到就按「正常响应」处理，宁可多缓存，也不能因为
-     * 反射失败让缓存功能整体失效。依赖的字段名：status、contentType、headers。
+     * 反射失败让缓存功能整体失效。
+     * 依赖的字段名：status、contentType、headers、cookies。
      *
-     * @return array{status: int, contentType: string, headers: array}
+     * @return array{status: int, contentType: string, headers: array, cookies: array}
      */
     private static function typechoResponseState(): array
     {
         static $props = null;
 
-        $fallback = ['status' => 200, 'contentType' => 'text/html', 'headers' => []];
+        $fallback = [
+            'status'      => 200,
+            'contentType' => 'text/html',
+            'headers'     => [],
+            'cookies'     => [],
+        ];
 
         // false 表示上一次反射就失败了（字段被改名 / 被移除），本请求内不再重试
         if ($props === false) {
@@ -1276,6 +1310,7 @@ class Plugin implements PluginInterface
                 'status'      => intval($props['status']->getValue($response)),
                 'contentType' => (string) $props['contentType']->getValue($response),
                 'headers'     => (array) $props['headers']->getValue($response),
+                'cookies'     => (array) $props['cookies']->getValue($response),
             ];
         } catch (Throwable $e) {
             $props = false;   // 别在同一请求里反复尝试
@@ -1329,16 +1364,34 @@ class Plugin implements PluginInterface
         // 硬编码的话，把站点 contentType 设成 application/xhtml+xml 的用户
         // 会发现整站突然不缓存了。
         $expectedType = strtolower(trim((string) (Helper::options()->contentType ?: 'text/html')));
-        $actualType   = strtolower(trim($state['contentType']));
 
-        if ($actualType !== $expectedType) {
+        if (strtolower(trim($state['contentType'])) !== $expectedType) {
             return false;
         }
 
-        foreach (array_keys($state['headers']) as $name) {
+        // contentType 字段只是 Content-Type 响应头的一份副本：setContentType() 会
+        // 同时写这两处，但**直接调 setHeader('Content-Type', …) 只写 headers**，
+        // 字段纹丝不动。所以真正的判据是 headers 里的值，上面那一比只是廉价前置。
+        // 头里的值形如 "text/html; charset=UTF-8"，比对前要剥掉参数部分。
+        foreach ($state['headers'] as $name => $value) {
             if (strcasecmp((string) $name, 'Location') === 0) {
                 return false;
             }
+
+            if (strcasecmp((string) $name, 'Content-Type') === 0) {
+                $headerType = strtolower(trim(explode(';', (string) $value, 2)[0]));
+                if ($headerType !== $expectedType) {
+                    return false;
+                }
+            }
+        }
+
+        // 待发送的 cookie 队列。Cookie::set() 会顺手写 $_COOKIE（下面第 4 段就是
+        // 靠它发现的），但更底层的 Response::setCookie() **只往这个 private 数组里
+        // append，$_COOKIE 完全不动** —— 主题或插件直接调它时，第 4 段看不见。
+        // 一个可缓存的 GET 上这个队列本来就该是空的。
+        if (!empty($state['cookies'])) {
+            return false;
         }
 
         // 4) Typecho 层设置的 cookie。Response::setCookie() 只把 cookie 存进数组、
@@ -1746,6 +1799,22 @@ class Plugin implements PluginInterface
     public static function clearCacheOnContentDelete(int $cid, PostEdit|PageEdit|AttachmentEdit $widget): void
     {
         self::purgeCache($cid, true, 'CONTENT DELETED' . ($cid > 0 ? ' CID ' . $cid : ''));
+
+        // 附件被删掉之后，引用它的那篇文章 / 页面里的图片就成了死链，
+        // 必须一并失效 —— 只清附件自己的页面是不够的。
+        //
+        // parent 读得到：Attachment\Edit::deleteByIds() 在触发本钩子之前已经用
+        // [$this, 'push'] 把整行压进了 widget（同一段代码里的
+        // Upload::deleteHandle($this->toColumn([... 'parent'])) 就在用它）。
+        //
+        // 第二次调用传 false：列表页缓存在上面那次已经清过了。
+        if ($widget instanceof AttachmentEdit) {
+            $parent = intval($widget->parent);
+
+            if ($parent > 0 && $parent !== $cid) {
+                self::purgeCache($parent, false, 'ATTACHMENT DELETED FROM CID ' . $parent);
+            }
+        }
     }
 
     /**
