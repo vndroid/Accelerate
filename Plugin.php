@@ -26,11 +26,11 @@ if (!defined('__TYPECHO_ROOT_DIR__')) {
 }
 
 /**
- * 页面缓存插件 via Redis for Typecho
+ * 页面缓存提速插件 for Typecho
  *
  * @package Accelerate
  * @author Vex
- * @version 0.1.1
+ * @version 0.1.3
  * @link https://github.com/vndroid/Accelerate
  */
 class Plugin implements PluginInterface
@@ -438,8 +438,9 @@ class Plugin implements PluginInterface
      * self::configPlugin），必须自己调 Helper::configPlugin()。
      *
      * @param array $settings 表单提交的配置
-     * @param bool  $isInit   是否为插件启用时写入的表单默认值
+     * @param bool $isInit 是否为插件启用时写入的表单默认值
      * @return void
+     * @throws PluginException
      */
     public static function configHandle(array $settings, bool $isInit): void
     {
@@ -476,6 +477,7 @@ class Plugin implements PluginInterface
      *
      * @param array $settings 即将保存的新配置
      * @return array 可能带上了新代次的配置
+     * @throws PluginException
      */
     private static function flushOnCriticalChange(array $settings): array
     {
@@ -1045,7 +1047,7 @@ class Plugin implements PluginInterface
         if (!$redis->set($lockKey, '1', ['nx', 'ex' => 300])) {
             // 已经有请求在迁移。**本次请求不能使用缓存** —— 此刻命名空间里
             // 还混着上一版语义的键，读到就可能是不该对外的内容（例如 v3 遗留的
-            // 密码文章明文），写进去的新键也可能被随后的清理扫掉。
+            // 密码文章明文），写进去的新键也可能被随后清理扫掉。
             return false;
         }
 
@@ -1448,8 +1450,8 @@ class Plugin implements PluginInterface
         //    全文，不持有的看到的是密码表单 —— 两种都不能进公共缓存。
         //    放在请求层判断而不是只判断单篇归档，是因为列表页同样会为持有
         //    cookie 的访客渲染出受保护文章的正文摘要。
-        //    本函数在 beforeRender() 里于「查缓存」之前调用，因此读、写两侧
-        //    同时被阻断：持有密码的访客既不会污染缓存，也不会命中别人的缓存。
+        //    本函数在 beforeRender() 里于「查缓存」之前调用，因此读、写两侧同时被阻断
+        //    持有密码的访客既不会污染缓存，也不会命中别人的缓存。
         //
         //    **必须先去掉 Typecho 的 cookie 前缀再比对**：Cookie::setPrefix() 会把
         //    md5($options->rootUrl) 拼在每个键名前面（var/Typecho/Cookie.php:69/128/142，
@@ -1643,7 +1645,7 @@ class Plugin implements PluginInterface
         }
 
         // 缓存未命中，开始输出缓冲。
-        // 同时给 $_COOKIE 拍一张快照，afterRender() 用它判断渲染期间是否动过
+        // 同时给 $_COOKIE 进行快照，afterRender() 用它判断渲染期间是否动过
         // cookie（那意味着响应绑定到了当前访客，不能进公共缓存）。
         self::$cookiesAtStart = $_COOKIE;
 
