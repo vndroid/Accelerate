@@ -76,8 +76,15 @@ if (isset($_POST['do']) && $_POST['do'] === 'flush') {
     $security->protect();
 
     try {
+        // flushAll() 用 null 区分「失败」与「确实是 0 条」。不区分的话，
+        // Redis 根本没连上时这里会显示成绿色的「已清空，共 0 条」。
         $flushed = Plugin::flushAll('MANUAL FLUSH FROM PANEL');
-        \Widget\Notice::alloc()->set(_t('已清空全部内容缓存，共 %d 条', $flushed), 'success');
+
+        if ($flushed === null) {
+            \Widget\Notice::alloc()->set(_t('清空缓存失败，请检查 Redis 连接。'), 'error');
+        } else {
+            \Widget\Notice::alloc()->set(_t('已清空全部内容缓存，共 %d 条', $flushed), 'success');
+        }
     } catch (\Throwable $e) {
         \Widget\Notice::alloc()->set(_t('清空缓存失败：%s', $e->getMessage()), 'error');
     }
@@ -135,6 +142,13 @@ if ($redis) {
 
 $allKeys = array_keys($allKeys);
 sort($allKeys);
+
+// 上面的上限判断是在整批 foreach 之后做的，COUNT 500 意味着最多可能溢出到
+// 5499 条。这里裁到准确的上限，免得页面上写着「前 5000 条」却列出更多。
+if (count($allKeys) > $scanLimit) {
+    $allKeys   = array_slice($allKeys, 0, $scanLimit);
+    $truncated = true;
+}
 
 $total      = count($allKeys);
 $totalPages = max(1, (int) ceil($total / $pageSize));
@@ -252,7 +266,19 @@ foreach ($pageKeys as $i => $key) {
                                                     <?php if ($item['cid'] !== ''): ?><strong>#<?php echo htmlspecialchars($item['cid']); ?></strong> &middot; <?php endif; ?><?php echo htmlspecialchars($item['md5Key']); ?>
                                                 </td>
                                                 <td><?php echo number_format($item['size'] / 1024, 2); ?> KB</td>
-                                                <td><?php echo $item['ttl'] > 0 ? $item['ttl'] . ' 秒' : '永久'; ?></td>
+                                                <td><?php
+                                                    // phpredis 的 ttl()：-1 = 键存在但没有过期时间，-2 = 键已不存在。
+                                                    // 原先两者都落进「永久」分支。内容键一律用 setex 写入，TTL 恒 >= 1，
+                                                    // 所以 -2 通常是这个键在 SCAN 与 pipeline 之间刚好过期了，
+                                                    // 而 -1 反倒说明有人手工往这个命名空间里塞过键。
+                                                    if ($item['ttl'] > 0) {
+                                                        echo intval($item['ttl']) . ' 秒';
+                                                    } elseif ($item['ttl'] === -1) {
+                                                        _e('永久');
+                                                    } else {
+                                                        _e('已过期');
+                                                    }
+                                                ?></td>
                                             </tr>
                                         <?php endforeach; ?>
                                     <?php else: ?>

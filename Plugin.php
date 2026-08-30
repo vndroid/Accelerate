@@ -17,6 +17,7 @@ use Widget\Archive;
 use Widget\User;
 use Widget\Contents\Post\Edit as PostEdit;
 use Widget\Contents\Page\Edit as PageEdit;
+use Widget\Contents\Attachment\Edit as AttachmentEdit;
 use Widget\Comments\Edit as CommentsEdit;
 use Widget\Feedback;
 
@@ -94,14 +95,18 @@ class Plugin implements PluginInterface
     private static bool $schemaReady = false;
 
     /**
-     * 进入 beforeRender() 时的 $_COOKIE 键集合
+     * 进入 beforeRender() 时的 $_COOKIE 快照
      *
-     * 用于在 afterRender() 里判断渲染期间是否新设过 cookie。
+     * 用于在 afterRender() 里判断渲染期间是否动过 cookie。
      * Typecho 的 Response::setCookie() 只把 cookie 存进数组、等 respond() 才发送，
      * headers_list() 看不到；但 Cookie::set() 会同步写 $_COOKIE（见
-     * var/Typecho/Cookie.php:143），所以比对键集合就能发现。
+     * var/Typecho/Cookie.php:143），所以比对 $_COOKIE 就能发现。
+     *
+     * 存整个数组而不是 array_keys()：键不变、**值**被刷新（访问计数、A/B 分桶、
+     * 语言偏好之类）同样意味着响应绑定到了当前访客。PHP 数组写时复制，
+     * $_COOKIE 又很小，存一份副本的成本可以忽略。
      */
-    private static array $cookieKeysAtStart = [];
+    private static array $cookiesAtStart = [];
 
     /**
      * 已注册延迟清理的 cid，避免批量操作时重复注册 shutdown 回调
@@ -154,6 +159,12 @@ class Plugin implements PluginInterface
         // 独立页面最长 pageExpire（默认一月）—— 内容都没了，缓存还在对外服务。
         PostEdit::pluginHandle()->finishDelete = [self::class, 'clearCacheOnContentDelete'];
         PageEdit::pluginHandle()->finishDelete = [self::class, 'clearCacheOnContentDelete'];
+
+        // 附件也要挂：archiveType 'attachment' 在 isCacheableArchive() 的白名单里，
+        // 附件页是会被缓存的。钩子在 Attachment\Edit::deleteByIds() 里，
+        // 签名与 Post / Page 的 finishDelete 完全一致。
+        // 附件「编辑」（updateAttachment()）核心没有提供任何钩子，覆盖不到。
+        AttachmentEdit::pluginHandle()->finishDelete = [self::class, 'clearCacheOnContentDelete'];
 
         // 当内容被标记为隐藏 / 私密 / 待审核时清除缓存。
         // Typecho 的状态变更走的是 markPost()/markPage()，不经过 finishPublish。
@@ -213,7 +224,7 @@ class Plugin implements PluginInterface
             // 旧缓存同样需要按「禁用时清理」的选择被清掉。
             $redis = self::initRedis(true);
             if ($redis) {
-                $cleanCount = self::deleteByPattern($redis, self::$prefix . '*');
+                $cleanCount = self::deleteByPattern($redis, self::$prefix . '*') ?? 0;
             }
         }
 
@@ -390,7 +401,17 @@ class Plugin implements PluginInterface
         if (($settings['enableCache'] ?? '0') === '1') {
             $result = self::selfTest($settings);
 
-            return _t('设置已保存。Redis 自检：') . $result['message'];
+            // 自检失败不阻止保存（Redis 临时不可达时，用户仍然需要能改 TTL、
+            // 改 URI 规则，甚至需要靠「保存正确的主机名」把自己救回来）。
+            // 但提示必须把后果说明白 —— 从 configCheck() 返回的消息，Typecho 一律
+            // 用 notice 类型渲染（Widget\Plugins\Edit:122-131），给不了红色，
+            // 只能靠文案区分。
+            return $result['ok']
+                ? _t('设置已保存，Redis 自检通过：') . $result['message']
+                : _t(
+                    '设置已保存，但 Redis 自检失败：%s —— 缓存暂时不会生效，请修正配置后重新保存。',
+                    $result['message']
+                );
         }
 
         return _t('设置已保存（缓存功能未启用）');
@@ -472,7 +493,8 @@ class Plugin implements PluginInterface
         self::writeLog(
             'cache-' . date('Y-m-d') . '.log',
             date('[Y-m-d H:i:s]') . ' CACHE: (FLUSHED) REASON: '
-                . str_pad('(CONFIG CHANGED)', 50) . 'SUM: (TOTAL ' . $deleted . ' KEYs)'
+                . str_pad('(CONFIG CHANGED)', 50)
+                . ($deleted === null ? 'SUM: (FAILED)' : 'SUM: (TOTAL ' . $deleted . ' KEYs)')
         );
     }
 
@@ -928,21 +950,25 @@ class Plugin implements PluginInterface
      *
      * 使用 SCAN 游标迭代而非 KEYS，避免键数量较多时阻塞 Redis 主线程。
      *
+     * 返回 null 而不是 0 表示**失败**。两者必须区分开：调用方（尤其是管理页）
+     * 需要能说清楚到底是「确实一条都没有」还是「Redis 出问题了」，
+     * 否则会出现「已清空全部内容缓存，共 0 条」这种明明失败却报成功的提示。
+     *
      * @param Redis  $redis
      * @param string $pattern 完整的键名匹配模式（需自行带上前缀）
-     * @return int 实际删除的键数量
+     * @return int|null 实际删除的键数量；失败返回 null
      */
-    private static function deleteByPattern(Redis $redis, string $pattern): int
+    private static function deleteByPattern(Redis $redis, string $pattern): ?int
     {
         // purgeCache() 一次会连调本函数 2~3 次。首次失败后连接已被标记为不可用，
         // 后面几次没必要再各抛一次异常、各写一行日志。
         if (self::$initFailed) {
-            return 0;
+            return null;
         }
 
         // 整段包在 attempt() 里：清理失败只记日志，绝不能让发布文章、提交评论
         // 这些核心操作因为 Redis 出问题而报错。
-        return intval(self::attempt(function () use ($redis, $pattern) {
+        $deleted = self::attempt(function () use ($redis, $pattern) {
             $deleted  = 0;
             $iterator = null;
 
@@ -957,7 +983,9 @@ class Plugin implements PluginInterface
             }
 
             return $deleted;
-        }, 0, 'cache purge (' . $pattern . ')'));
+        }, null, 'cache purge (' . $pattern . ')');
+
+        return $deleted === null ? null : intval($deleted);
     }
 
     /**
@@ -1204,19 +1232,70 @@ class Plugin implements PluginInterface
     }
 
     /**
+     * 读取 Typecho\Response 对象的内部状态
+     *
+     * Response 把状态码、内容类型和待发送的响应头全部存成 private 字段，
+     * 且**没有提供任何 getter**（var/Typecho/Response.php:85/100/105）。
+     * 更麻烦的是它在前台正常渲染时压根不会把这些发出去：全项目里 sendHeaders()
+     * 只出现在异常处理（var/Widget/Init.php:42）和 redirect() / throwJson() /
+     * throwFinish() 这几条**都会 exit** 的路径上，而 Common::init() 里那个带
+     * sendHeaders 回调的 ob_start 只有 install.php 用。所以 afterRender 时
+     * headers_list() 里既没有 Content-Type 也没有状态码 —— 想知道应用层的意图，
+     * 只能反射。
+     *
+     * **这是对 Typecho 私有字段的脆弱耦合**，字段一旦改名就读不到了，因此整段
+     * 包在 try/catch 里：读不到就按「正常响应」处理，宁可多缓存，也不能因为
+     * 反射失败让缓存功能整体失效。依赖的字段名：status、contentType、headers。
+     *
+     * @return array{status: int, contentType: string, headers: array}
+     */
+    private static function typechoResponseState(): array
+    {
+        static $props = null;
+
+        $fallback = ['status' => 200, 'contentType' => 'text/html', 'headers' => []];
+
+        // false 表示上一次反射就失败了（字段被改名 / 被移除），本请求内不再重试
+        if ($props === false) {
+            return $fallback;
+        }
+
+        try {
+            if ($props === null) {
+                $props = [];
+                foreach (array_keys($fallback) as $name) {
+                    $property = new \ReflectionProperty(\Typecho\Response::class, $name);
+                    $property->setAccessible(true);
+                    $props[$name] = $property;
+                }
+            }
+
+            $response = \Typecho\Response::getInstance();
+
+            return [
+                'status'      => intval($props['status']->getValue($response)),
+                'contentType' => (string) $props['contentType']->getValue($response),
+                'headers'     => (array) $props['headers']->getValue($response),
+            ];
+        } catch (Throwable $e) {
+            $props = false;   // 别在同一请求里反复尝试
+            return $fallback;
+        }
+    }
+
+    /**
      * 渲染结束后，判断这个响应本身是否适合被缓存
      *
      * isCacheableArchive() 拦的是 Typecho 自己产出的 404 / 403，但主题或其他插件
-     * 在渲染期间仍可能把响应变成别的东西。命中缓存时插件是以 200 text/html 输出的，
-     * 所以任何非 200、带跳转、或与访客绑定的响应都不能进缓存。
+     * 在渲染期间仍可能把响应变成别的东西。缓存命中时插件是无条件把内容当成一个
+     * 正常页面吐出去的，所以凡是应用层意图并非「普通 HTML 页面」的响应，
+     * 都不能进缓存 —— 否则一次 503 或一次 JSON 输出会被存下来，之后无差别地
+     * 喂给所有访客。
      *
-     * 说明一下这里**没有**检查什么、以及为什么：
-     * - 301/302：Typecho 自己的 redirect() 走 Response::respond()，那个方法末尾
-     *   就是 exit（var/Typecho/Response.php:235），afterRender 根本不会执行。
-     *   这里的 Location 检查只针对主题裸调 header() 且不 exit 的情况。
-     * - Typecho 自己 setStatus() 的状态码：Response::$status 是 private 且没有
-     *   getStatus()，读不到。已知会设状态码的两条路径（404、密码文章 403）
-     *   都在 isCacheableArchive() 里按归档类型拦掉了。
+     * 这里**没有**检查 301/302，因为 Typecho 自己的 redirect() 走
+     * Response::respond()，那个方法末尾就是 exit（var/Typecho/Response.php:235），
+     * afterRender 根本不会执行。下面的 Location 检查针对的是主题裸调 header()
+     * 不 exit、以及通过 Typecho API setHeader('Location', …) 两种情况。
      *
      * @return bool
      */
@@ -1227,18 +1306,47 @@ class Plugin implements PluginInterface
             return false;
         }
 
-        // 2) 渲染期间直接发出的跳转或个性化响应头
+        // 2) 渲染期间用裸 header() 发出的跳转或个性化响应头
         foreach (headers_list() as $header) {
             if (stripos($header, 'Location:') === 0 || stripos($header, 'Set-Cookie:') === 0) {
                 return false;
             }
         }
 
-        // 3) Typecho 层设置的 cookie。Response::setCookie() 只把 cookie 存进数组、
+        // 3) Typecho Response 对象里记下的意图（反射读取，见上面的说明）。
+        //    这一段拦的是 setStatus(503)、setContentType('application/json')、
+        //    setHeader('Location', …) 这类只存进对象、没有真正发出去的调用。
+        $state = self::typechoResponseState();
+
+        if ($state['status'] !== 200) {
+            return false;
+        }
+
+        // 与站点配置的内容类型逐字比对，而不是硬编码 text/html。
+        // Widget\Init 启动时就把 $options->contentType 灌进了 Response
+        // （var/Widget/Init.php:109），正常渲染时两者必然相等；一旦不等，
+        // 就说明渲染途中有人把它改成了别的东西（application/json 之类）。
+        // 硬编码的话，把站点 contentType 设成 application/xhtml+xml 的用户
+        // 会发现整站突然不缓存了。
+        $expectedType = strtolower(trim((string) (Helper::options()->contentType ?: 'text/html')));
+        $actualType   = strtolower(trim($state['contentType']));
+
+        if ($actualType !== $expectedType) {
+            return false;
+        }
+
+        foreach (array_keys($state['headers']) as $name) {
+            if (strcasecmp((string) $name, 'Location') === 0) {
+                return false;
+            }
+        }
+
+        // 4) Typecho 层设置的 cookie。Response::setCookie() 只把 cookie 存进数组、
         //    等 respond() 才发送，headers_list() 看不到；但 Cookie::set() 会同步写
-        //    $_COOKIE（var/Typecho/Cookie.php:143），所以比对键集合就能发现。
-        //    渲染期间新设或删除 cookie，都意味着这个响应是绑定到当前访客的。
-        if (array_keys($_COOKIE) !== self::$cookieKeysAtStart) {
+        //    $_COOKIE（var/Typecho/Cookie.php:143），所以比对 $_COOKIE 就能发现。
+        //    用 !== 全量比较：新增、删除、以及**值被改写**都算，任何一种都说明
+        //    这个响应是绑定到当前访客的。
+        if ($_COOKIE !== self::$cookiesAtStart) {
             return false;
         }
 
@@ -1482,9 +1590,9 @@ class Plugin implements PluginInterface
         }
 
         // 缓存未命中，开始输出缓冲。
-        // 同时记下当前的 cookie 键集合，afterRender() 用它判断渲染期间是否
-        // 新设过 cookie（那意味着响应绑定到了当前访客，不能进公共缓存）。
-        self::$cookieKeysAtStart = array_keys($_COOKIE);
+        // 同时给 $_COOKIE 拍一张快照，afterRender() 用它判断渲染期间是否动过
+        // cookie（那意味着响应绑定到了当前访客，不能进公共缓存）。
+        self::$cookiesAtStart = $_COOKIE;
 
         ob_start();
         self::$obStarted = true;
@@ -1631,11 +1739,11 @@ class Plugin implements PluginInterface
      * 传入的第一个参数就是 cid 本身（来自 request 的 int 过滤），不是内容数组。
      *
      * @param int $cid 被删除内容的 ID
-     * @param PostEdit|PageEdit $widget 编辑组件
+     * @param PostEdit|PageEdit|AttachmentEdit $widget 编辑组件
      * @return void
      * @throws PluginException
      */
-    public static function clearCacheOnContentDelete(int $cid, PostEdit|PageEdit $widget): void
+    public static function clearCacheOnContentDelete(int $cid, PostEdit|PageEdit|AttachmentEdit $widget): void
     {
         self::purgeCache($cid, true, 'CONTENT DELETED' . ($cid > 0 ? ' CID ' . $cid : ''));
     }
@@ -1828,10 +1936,10 @@ class Plugin implements PluginInterface
      * 用 class_exists 保护即可，调用方不会因为未安装本插件而报错。
      *
      * @param string $reason 写入日志的原因说明
-     * @return int 实际删除的键数量
+     * @return int|null 实际删除的键数量；Redis 不可用或清理失败时返回 null
      * @throws PluginException
      */
-    public static function flushAll(string $reason = 'MANUAL FLUSH'): int
+    public static function flushAll(string $reason = 'MANUAL FLUSH'): ?int
     {
         return self::purgeCache(0, true, $reason);
     }
@@ -1843,25 +1951,37 @@ class Plugin implements PluginInterface
      *                           小于等于 0 时作为兜底清理全部单篇缓存
      * @param bool   $clearLists 是否一并清理列表页缓存
      * @param string $reason     写入日志的原因说明
-     * @return int 实际删除的键数量
+     * @return int|null 实际删除的键数量；Redis 不可用或任一段清理失败时返回 null
      * @throws PluginException
      */
-    private static function purgeCache(int $cid, bool $clearLists, string $reason): int
+    private static function purgeCache(int $cid, bool $clearLists, string $reason): ?int
     {
         // 传 true 忽略 enableCache 开关。用户关掉缓存之后，删除 / 隐藏 / 评论等
         // 失效操作原先完全拿不到连接，等他重新打开缓存，未过 TTL 的旧页面就会
         // 原样复活。清理动作和「是否启用缓存」本来就是两回事。
         $redis = self::initRedis(true);
         if (!$redis) {
-            return 0;
+            return null;
         }
 
-        $scope   = $cid > 0 ? $cid . ':*' : '*';
-        $deleted = self::deleteByPattern($redis, self::$prefix . 'post:' . $scope)
-            + self::deleteByPattern($redis, self::$prefix . 'page:' . $scope);
+        $scope    = $cid > 0 ? $cid . ':*' : '*';
+        $patterns = [
+            self::$prefix . 'post:' . $scope,
+            self::$prefix . 'page:' . $scope,
+        ];
 
         if ($clearLists) {
-            $deleted += self::deleteByPattern($redis, self::$prefix . 'list:*');
+            $patterns[] = self::$prefix . 'list:*';
+        }
+
+        // 任何一段失败都整体报失败：这时候「删了几条」已经不可信了
+        $deleted = 0;
+        foreach ($patterns as $pattern) {
+            $count = self::deleteByPattern($redis, $pattern);
+            if ($count === null) {
+                return null;
+            }
+            $deleted += $count;
         }
 
         if ($deleted <= 0) {
