@@ -9,6 +9,7 @@ use Typecho\Db\Exception as DbException;
 use Typecho\Plugin\Exception as PluginException;
 use Typecho\Plugin\PluginInterface;
 use Typecho\Widget\Helper\Form;
+use Typecho\Widget\Helper\Form\Element\Hidden;
 use Typecho\Widget\Helper\Form\Element\Text;
 use Typecho\Widget\Helper\Form\Element\Password;
 use Typecho\Widget\Helper\Form\Element\Radio;
@@ -261,6 +262,13 @@ class Plugin implements PluginInterface
      */
     public static function config(Form $form): void
     {
+        // Typecho 在重新打开插件设置页时，会遍历数据库中的全部配置项并按名称
+        // 查找对应的表单控件。cacheGeneration 虽然是内部状态，也必须注册到 Form，
+        // 否则一旦它被写入数据库，下一次打开设置页就会对 null 调用 value()。
+        // 提交值不受信任，configHandle() 会始终用服务端保存的值覆盖它。
+        $cacheGeneration = new Hidden('cacheGeneration', null, '0');
+        $form->addInput($cacheGeneration);
+
         $enableCache = new Radio(
             'enableCache',
             ['1' => _t('启用'), '0' => _t('禁用')],
@@ -444,8 +452,10 @@ class Plugin implements PluginInterface
      */
     public static function configHandle(array $settings, bool $isInit): void
     {
-        // 启用插件时写入的是表单默认值，本来就合法，直接落库
-        if (!$isInit) {
+        // cacheGeneration 是服务端内部状态，不能信任隐藏字段提交的值。
+        if ($isInit) {
+            $settings['cacheGeneration'] = 0;
+        } else {
             if (!empty(self::validateConfig($settings))) {
                 // 校验不通过就不写库，原有配置保持不变。
                 // 提示信息由 configCheck() 负责，这里静默返回即可。
@@ -485,8 +495,13 @@ class Plugin implements PluginInterface
             $old = Helper::options()->plugin(basename(__DIR__));
         } catch (Throwable $e) {
             // 还没有旧配置（首次保存），无需清理
+            $settings['cacheGeneration'] = 0;
             return $settings;
         }
+
+        // 无论客户端提交了什么，都以数据库中的服务端状态为准；关键配置变化时
+        // 再由下方逻辑递增。这样隐藏字段只负责满足 Typecho 的表单映射约束。
+        $settings['cacheGeneration'] = intval($old->cacheGeneration ?? 0);
 
         $watched = ['enableCache', 'uriPrefix', 'uriSuffix', 'siteTag', 'host', 'port', 'password'];
         $changed = false;
@@ -502,10 +517,8 @@ class Plugin implements PluginInterface
             return $settings;
         }
 
-        // 递增代次。cacheGeneration 不在 config(Form) 里声明，所以 getAllRequest()
-        // 不会带它；而 Helper::configPlugin() 内部是 array_merge($已存, $settings)，
-        // 因此不主动写的时候旧值会自然保留。
-        $settings['cacheGeneration'] = intval($old->cacheGeneration ?? 0) + 1;
+        // 关键配置发生变化，只允许服务端递增代次。
+        $settings['cacheGeneration']++;
 
         // initRedis() 此刻读到的仍是旧配置，self::$prefix 也是旧前缀 —— 正是所需
         $redis = self::initRedis(true);
