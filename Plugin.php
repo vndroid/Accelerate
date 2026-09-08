@@ -242,6 +242,29 @@ class Plugin implements PluginInterface
             }
         }
 
+        // 选择「保留」时这里**刻意完全不碰 Redis**：不连接、不 SCAN、不 DEL。
+        // 这正是这个选项存在的意义 —— 命名空间很大时不让禁用动作卡住，或者把数据
+        // 留在那儿排查问题。内容键全部由 setex 写入，会按各自 TTL 自然过期；
+        // 只有 {prefix}schema 是裸 set()、没有 TTL，会留下一个孤儿键，
+        // 为一个键专门连一次 Redis（还可能触发一轮 SCAN 迁移）不划算。
+        //
+        // 需要知道的是：**重新启用之后这批缓存不会被复用，必然冷启动。**
+        // 这是想要的行为 —— 禁用期间所有失效钩子都不运行，文章删除 / 隐藏、
+        // 评论增删改、主题切换统统感知不到，复用等于对外提供陈旧内容。
+        //
+        // 但要留意，这条保证**目前是代次机制的副产品，而不是显式实现的**：
+        // Typecho 禁用插件时会删掉 plugin:Accelerate 配置行
+        // （var/Widget/Plugins/Edit.php），重新启用时写入的是表单默认值，
+        // 其中 enableCache = '0'；用户再把它打回 '1' 就构成一次关键配置变化，
+        // cacheGeneration 0→1，哨兵必然对不上，于是触发全量作废。
+        //
+        // 也就是说它依赖两件事同时成立：cacheGeneration 会随配置行一起被删除，
+        // 且 enableCache 在 flushOnCriticalChange() 的 $watched 列表里。
+        // 将来若把代次持久化到不会被 Typecho 删除的地方（评估过这个方案，
+        // 目的是让「切走→切回旧命名空间」更严密），**必须同时用别的方式
+        // 把「重新启用冷启动」这条保证补回来**，否则会静默地把禁用期陈旧缓存
+        // 这个隐患放回去。
+
         if ($config->debug == '1' && $cleanCount > 0) {
             self::writeLog(
                 'cache-' . date('Y-m-d') . '.log',
@@ -382,7 +405,7 @@ class Plugin implements PluginInterface
             ['1' => _t('清理'), '0' => _t('保留')],
             '1',
             _t('禁用时清理缓存'),
-            _t('禁用插件时是否清理 Redis 中的所有缓存数据，默认清理')
+            _t('禁用插件时是否删除 Redis 中的缓存，默认清理。选择「保留」仅表示禁用时不扫描不删除，数据按 TTL 自然过期；重新启用后不会复用这批缓存 —— 禁用期间的内容改动无法感知，会整体作废以免提供陈旧内容')
         );
         $form->addInput($cleanCacheOnDeactivate);
     }
