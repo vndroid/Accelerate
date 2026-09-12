@@ -32,10 +32,19 @@ if (!defined('__TYPECHO_ROOT_DIR__')) {
  * @package Accelerate
  * @author Vex
  * @version 0.1.3
+ * @since 1.2.0
  * @link https://github.com/vndroid/Accelerate
  */
 class Plugin implements PluginInterface
 {
+    /**
+     * 最低支持的 PHP 版本。
+     *
+     * 注意：插件头中的 @since 表示最低 Typecho 版本，不能用于声明 PHP 版本。
+     */
+    private const MIN_PHP_VERSION_ID = 80200;
+    private const MIN_PHP_VERSION = '8.2.0';
+
     /**
      * 缓存键结构版本
      *
@@ -150,6 +159,15 @@ class Plugin implements PluginInterface
      */
     public static function activate(): string
     {
+        // PHP 版本必须先于扩展检查，避免在不受支持的运行环境里给出误导性提示。
+        if (PHP_VERSION_ID < self::MIN_PHP_VERSION_ID) {
+            throw new PluginException(_t(
+                'Accelerate 需要 PHP %s 或更高版本，当前版本为 %s',
+                self::MIN_PHP_VERSION,
+                PHP_VERSION
+            ));
+        }
+
         // 检查 PHP 扩展
         if (!extension_loaded('redis')) {
             throw new PluginException(_t('检测到当前 PHP 环境缺失 redis 扩展'));
