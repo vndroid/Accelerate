@@ -2,7 +2,17 @@ name: PHP compatibility
 
 on:
   push:
+    paths:
+      - 'Plugin.php'
+      - 'Panel.php'
+      - 'assets/**'
+      - '.github/workflows/php-compatibility.yml'
   pull_request:
+    paths:
+      - 'Plugin.php'
+      - 'Panel.php'
+      - 'assets/**'
+      - '.github/workflows/php-compatibility.yml'
 
 jobs:
   syntax-check:
